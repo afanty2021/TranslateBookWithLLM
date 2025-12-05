@@ -7,5 +7,6 @@ __pycache__/
 .claude/
 CLAUDE.md
 .env
+.spec-workflow/
 /docs
 /venv
