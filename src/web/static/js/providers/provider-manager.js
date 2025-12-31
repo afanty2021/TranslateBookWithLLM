@@ -10,6 +10,8 @@ import { ApiClient } from '../core/api-client.js';
 import { MessageLogger } from '../ui/message-logger.js';
 import { DomHelpers } from '../ui/dom-helpers.js';
 import { ModelDetector } from './model-detector.js';
+import { SettingsManager } from '../core/settings-manager.js';
+import { ApiKeyUtils } from '../utils/api-key-utils.js';
 
 /**
  * Common OpenAI models list
@@ -23,6 +25,27 @@ const OPENAI_MODELS = [
 ];
 
 /**
+ * Fallback OpenRouter models list (used when API fetch fails)
+ * Sorted by cost: cheap first
+ */
+const OPENROUTER_FALLBACK_MODELS = [
+    // Cheap models
+    { value: 'google/gemini-2.0-flash-001', label: 'Gemini 2.0 Flash' },
+    { value: 'meta-llama/llama-3.3-70b-instruct', label: 'Llama 3.3 70B' },
+    { value: 'qwen/qwen-2.5-72b-instruct', label: 'Qwen 2.5 72B' },
+    { value: 'mistralai/mistral-small-24b-instruct-2501', label: 'Mistral Small 24B' },
+    // Mid-tier models
+    { value: 'anthropic/claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku' },
+    { value: 'openai/gpt-4o-mini', label: 'GPT-4o Mini' },
+    { value: 'google/gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+    { value: 'deepseek/deepseek-chat', label: 'DeepSeek Chat' },
+    // Premium models
+    { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4' },
+    { value: 'openai/gpt-4o', label: 'GPT-4o' },
+    { value: 'anthropic/claude-3-5-sonnet-20241022', label: 'Claude 3.5 Sonnet' }
+];
+
+/**
  * Auto-retry configuration for Ollama
  */
 const OLLAMA_RETRY_INTERVAL = 3000; // 3 seconds
@@ -31,16 +54,30 @@ let ollamaRetryTimer = null;
 let ollamaRetryCount = 0;
 
 /**
+ * Format price for display (per 1M tokens)
+ * @param {number} price - Price per 1M tokens
+ * @returns {string} Formatted price string
+ */
+function formatPrice(price) {
+    if (price === 0) return 'Free';
+    if (price < 0.01) return '<$0.01';
+    if (price < 1) return `$${price.toFixed(2)}`;
+    return `$${price.toFixed(2)}`;
+}
+
+/**
  * Populate model select with options
  * @param {Array} models - Array of model objects or strings
- * @param {string} defaultModel - Default model to select
- * @param {string} provider - Provider type ('ollama', 'gemini', 'openai')
+ * @param {string} defaultModel - Default model to select (from .env)
+ * @param {string} provider - Provider type ('ollama', 'gemini', 'openai', 'openrouter')
+ * @returns {boolean} True if defaultModel was found and selected
  */
 function populateModelSelect(models, defaultModel = null, provider = 'ollama') {
     const modelSelect = DomHelpers.getElement('model');
-    if (!modelSelect) return;
+    if (!modelSelect) return false;
 
     modelSelect.innerHTML = '';
+    let defaultModelFound = false;
 
     if (provider === 'gemini') {
         models.forEach(model => {
@@ -48,7 +85,10 @@ function populateModelSelect(models, defaultModel = null, provider = 'ollama') {
             option.value = model.name;
             option.textContent = `${model.displayName || model.name} - ${model.description || ''}`;
             option.title = `Input: ${model.inputTokenLimit || 'N/A'} tokens, Output: ${model.outputTokenLimit || 'N/A'} tokens`;
-            if (model.name === defaultModel) option.selected = true;
+            if (model.name === defaultModel) {
+                option.selected = true;
+                defaultModelFound = true;
+            }
             modelSelect.appendChild(option);
         });
     } else if (provider === 'openai') {
@@ -56,6 +96,34 @@ function populateModelSelect(models, defaultModel = null, provider = 'ollama') {
             const option = document.createElement('option');
             option.value = model.value;
             option.textContent = model.label;
+            if (model.value === defaultModel) {
+                option.selected = true;
+                defaultModelFound = true;
+            }
+            modelSelect.appendChild(option);
+        });
+    } else if (provider === 'openrouter') {
+        models.forEach(model => {
+            const option = document.createElement('option');
+            // Handle both API response format (id) and fallback format (value)
+            const modelId = model.id || model.value;
+            option.value = modelId;
+
+            // Format label with pricing info if available
+            if (model.pricing && model.pricing.prompt_per_million !== undefined) {
+                const inputPrice = formatPrice(model.pricing.prompt_per_million);
+                const outputPrice = formatPrice(model.pricing.completion_per_million);
+                option.textContent = `${model.name || modelId} (In: ${inputPrice}/M, Out: ${outputPrice}/M)`;
+                option.title = `Context: ${model.context_length || 'N/A'} tokens`;
+            } else {
+                // Fallback format
+                option.textContent = model.label || model.name || modelId;
+            }
+
+            if (modelId === defaultModel) {
+                option.selected = true;
+                defaultModelFound = true;
+            }
             modelSelect.appendChild(option);
         });
     } else {
@@ -64,10 +132,15 @@ function populateModelSelect(models, defaultModel = null, provider = 'ollama') {
             const option = document.createElement('option');
             option.value = modelName;
             option.textContent = modelName;
-            if (modelName === defaultModel) option.selected = true;
+            if (modelName === defaultModel) {
+                option.selected = true;
+                defaultModelFound = true;
+            }
             modelSelect.appendChild(option);
         });
     }
+
+    return defaultModelFound;
 }
 
 export const ProviderManager = {
@@ -82,6 +155,22 @@ export const ProviderManager = {
                 // Stop any ongoing Ollama retries when switching providers
                 this.stopOllamaAutoRetry();
                 this.toggleProviderSettings();
+            });
+        }
+
+        // Add listener for OpenAI endpoint changes (for local server support)
+        const openaiEndpoint = DomHelpers.getElement('openaiEndpoint');
+        if (openaiEndpoint) {
+            // Use debounce to avoid too many requests while typing
+            let endpointTimeout = null;
+            openaiEndpoint.addEventListener('input', () => {
+                clearTimeout(endpointTimeout);
+                endpointTimeout = setTimeout(() => {
+                    const currentProvider = DomHelpers.getValue('llmProvider');
+                    if (currentProvider === 'openai') {
+                        this.loadOpenAIModels();
+                    }
+                }, 500); // Wait 500ms after user stops typing
             });
         }
 
@@ -102,24 +191,39 @@ export const ProviderManager = {
         // Get provider settings elements
         const ollamaSettings = DomHelpers.getElement('ollamaSettings');
         const geminiSettings = DomHelpers.getElement('geminiSettings');
-        const openaiSettings = DomHelpers.getElement('openaiSettings');
+        const openaiApiKeyGroup = DomHelpers.getElement('openaiApiKeyGroup');
+        const openaiEndpointRow = DomHelpers.getElement('openaiEndpointRow');
+        const openrouterSettings = DomHelpers.getElement('openrouterSettings');
 
         // Show/hide provider-specific settings (use inline style for elements with inline display:none)
         if (provider === 'ollama') {
             DomHelpers.show('ollamaSettings');
             if (geminiSettings) geminiSettings.style.display = 'none';
-            if (openaiSettings) openaiSettings.style.display = 'none';
+            if (openaiApiKeyGroup) openaiApiKeyGroup.style.display = 'none';
+            if (openaiEndpointRow) openaiEndpointRow.style.display = 'none';
+            if (openrouterSettings) openrouterSettings.style.display = 'none';
             if (loadModels) this.loadOllamaModels();
         } else if (provider === 'gemini') {
             DomHelpers.hide('ollamaSettings');
             if (geminiSettings) geminiSettings.style.display = 'block';
-            if (openaiSettings) openaiSettings.style.display = 'none';
+            if (openaiApiKeyGroup) openaiApiKeyGroup.style.display = 'none';
+            if (openaiEndpointRow) openaiEndpointRow.style.display = 'none';
+            if (openrouterSettings) openrouterSettings.style.display = 'none';
             if (loadModels) this.loadGeminiModels();
         } else if (provider === 'openai') {
             DomHelpers.hide('ollamaSettings');
             if (geminiSettings) geminiSettings.style.display = 'none';
-            if (openaiSettings) openaiSettings.style.display = 'block';
+            if (openaiApiKeyGroup) openaiApiKeyGroup.style.display = 'block';
+            if (openaiEndpointRow) openaiEndpointRow.style.display = 'block';
+            if (openrouterSettings) openrouterSettings.style.display = 'none';
             if (loadModels) this.loadOpenAIModels();
+        } else if (provider === 'openrouter') {
+            DomHelpers.hide('ollamaSettings');
+            if (geminiSettings) geminiSettings.style.display = 'none';
+            if (openaiApiKeyGroup) openaiApiKeyGroup.style.display = 'none';
+            if (openaiEndpointRow) openaiEndpointRow.style.display = 'none';
+            if (openrouterSettings) openrouterSettings.style.display = 'block';
+            if (loadModels) this.loadOpenRouterModels();
         }
     },
 
@@ -135,6 +239,8 @@ export const ProviderManager = {
             this.loadGeminiModels();
         } else if (provider === 'openai') {
             this.loadOpenAIModels();
+        } else if (provider === 'openrouter') {
+            this.loadOpenRouterModels();
         }
     },
 
@@ -179,8 +285,17 @@ export const ProviderManager = {
                 this.stopOllamaAutoRetry();
 
                 MessageLogger.showMessage('', '');
-                populateModelSelect(data.models, data.default, 'ollama');
+                const envModelApplied = populateModelSelect(data.models, data.default, 'ollama');
                 MessageLogger.addLog(`✅ ${data.count} LLM model(s) loaded. Default: ${data.default}`);
+
+                // If .env model was found and applied, lock it in
+                if (envModelApplied && data.default) {
+                    SettingsManager.markEnvModelApplied();
+                }
+
+                // Apply saved model preference if any (will be skipped if .env model was applied)
+                SettingsManager.applyPendingModelSelection();
+
                 ModelDetector.checkAndShowRecommendation();
 
                 // Update available models in state
@@ -262,13 +377,23 @@ export const ProviderManager = {
         modelSelect.innerHTML = '<option value="">Loading Gemini models...</option>';
 
         try {
-            const apiKey = DomHelpers.getValue('geminiApiKey').trim();
+            // Use ApiKeyUtils to get API key (returns '__USE_ENV__' if configured in .env)
+            const apiKey = ApiKeyUtils.getValue('geminiApiKey');
             const data = await ApiClient.getModels('gemini', { apiKey });
 
             if (data.models && data.models.length > 0) {
                 MessageLogger.showMessage('', '');
-                populateModelSelect(data.models, data.default, 'gemini');
+                const envModelApplied = populateModelSelect(data.models, data.default, 'gemini');
                 MessageLogger.addLog(`✅ ${data.count} Gemini model(s) loaded (excluding thinking models)`);
+
+                // If .env model was found and applied, lock it in
+                if (envModelApplied && data.default) {
+                    SettingsManager.markEnvModelApplied();
+                }
+
+                // Apply saved model preference if any (will be skipped if .env model was applied)
+                SettingsManager.applyPendingModelSelection();
+
                 ModelDetector.checkAndShowRecommendation();
 
                 // Update available models in state
@@ -288,23 +413,125 @@ export const ProviderManager = {
     },
 
     /**
-     * Load OpenAI models (static list)
+     * Load OpenAI-compatible models dynamically
+     * For local servers (llama.cpp, LM Studio, vLLM, etc.): fetches models from the local server
+     * For OpenAI: uses static list (dynamic fetch requires valid API key)
      */
     async loadOpenAIModels() {
         const modelSelect = DomHelpers.getElement('model');
         if (!modelSelect) return;
 
+        // Get API endpoint to determine if it's a local server or OpenAI cloud
+        const apiEndpoint = DomHelpers.getValue('openaiEndpoint') || 'https://api.openai.com/v1/chat/completions';
+        const isLocal = apiEndpoint.includes('localhost') || apiEndpoint.includes('127.0.0.1');
+
+        if (isLocal) {
+            // Local server (llama.cpp, LM Studio, vLLM, etc.): try to fetch models dynamically
+            modelSelect.innerHTML = '<option value="">Loading models from local server...</option>';
+
+            try {
+                const apiKey = ApiKeyUtils.getValue('openaiApiKey');
+                const data = await ApiClient.getModels('openai', { apiKey, apiEndpoint });
+
+                if (data.models && data.models.length > 0) {
+                    MessageLogger.showMessage('', '');
+
+                    // Format models for the dropdown
+                    const formattedModels = data.models.map(m => ({
+                        value: m.id,
+                        label: m.name || m.id
+                    }));
+
+                    const envModelApplied = populateModelSelect(formattedModels, data.default, 'openai');
+                    MessageLogger.addLog(`✅ ${data.count} model(s) loaded from local server`);
+
+                    if (envModelApplied && data.default) {
+                        SettingsManager.markEnvModelApplied();
+                    }
+
+                    SettingsManager.applyPendingModelSelection();
+                    ModelDetector.checkAndShowRecommendation();
+
+                    StateManager.setState('models.availableModels', formattedModels.map(m => m.value));
+                    return;
+                } else {
+                    // Local server not running or no models
+                    const errorMsg = data.error || 'Local server not accessible';
+                    MessageLogger.showMessage(`⚠️ ${errorMsg}`, 'warning');
+                    MessageLogger.addLog(`⚠️ ${errorMsg}. Using fallback OpenAI models.`);
+                }
+            } catch (error) {
+                MessageLogger.showMessage(`⚠️ Could not connect to local server. Using fallback models.`, 'warning');
+                MessageLogger.addLog(`⚠️ Local server connection error: ${error.message}`);
+            }
+        }
+
+        // Fallback: use static OpenAI models list
         populateModelSelect(OPENAI_MODELS, null, 'openai');
         MessageLogger.addLog(`✅ OpenAI models loaded (common models)`);
+
+        SettingsManager.applyPendingModelSelection();
         ModelDetector.checkAndShowRecommendation();
 
-        // Update available models in state
         StateManager.setState('models.availableModels', OPENAI_MODELS.map(m => m.value));
     },
 
     /**
+     * Load OpenRouter models dynamically from API (text-only models, sorted by price)
+     */
+    async loadOpenRouterModels() {
+        const modelSelect = DomHelpers.getElement('model');
+        if (!modelSelect) return;
+
+        modelSelect.innerHTML = '<option value="">Loading OpenRouter models...</option>';
+
+        try {
+            // Use ApiKeyUtils to get API key (returns '__USE_ENV__' if configured in .env)
+            const apiKey = ApiKeyUtils.getValue('openrouterApiKey');
+            const data = await ApiClient.getModels('openrouter', { apiKey });
+
+            if (data.models && data.models.length > 0) {
+                MessageLogger.showMessage('', '');
+                const envModelApplied = populateModelSelect(data.models, data.default, 'openrouter');
+                MessageLogger.addLog(`✅ ${data.count} OpenRouter text models loaded (sorted by price, cheapest first)`);
+
+                // If .env model was found and applied, lock it in
+                if (envModelApplied && data.default) {
+                    SettingsManager.markEnvModelApplied();
+                }
+
+                // Apply saved model preference if any (will be skipped if .env model was applied)
+                SettingsManager.applyPendingModelSelection();
+
+                ModelDetector.checkAndShowRecommendation();
+
+                // Update available models in state
+                StateManager.setState('models.availableModels', data.models.map(m => m.id));
+            } else {
+                // Use fallback list
+                const errorMessage = data.error || 'Could not load models from OpenRouter API';
+                MessageLogger.showMessage(`⚠️ ${errorMessage}. Using fallback list.`, 'warning');
+                populateModelSelect(OPENROUTER_FALLBACK_MODELS, 'anthropic/claude-sonnet-4', 'openrouter');
+                MessageLogger.addLog(`⚠️ Using fallback OpenRouter models list`);
+
+                // Update available models in state
+                StateManager.setState('models.availableModels', OPENROUTER_FALLBACK_MODELS.map(m => m.value));
+            }
+
+        } catch (error) {
+            // Use fallback list on error
+            MessageLogger.showMessage(`⚠️ Error fetching OpenRouter models. Using fallback list.`, 'warning');
+            MessageLogger.addLog(`⚠️ OpenRouter API error: ${error.message}. Using fallback list.`);
+            populateModelSelect(OPENROUTER_FALLBACK_MODELS, 'anthropic/claude-sonnet-4', 'openrouter');
+
+            // Update available models in state
+            StateManager.setState('models.availableModels', OPENROUTER_FALLBACK_MODELS.map(m => m.value));
+        }
+    },
+
+    /**
      * Get current provider
-     * @returns {string} Current provider ('ollama', 'gemini', 'openai')
+     * @returns {string} Current provider ('ollama', 'gemini', 'openai', 'openrouter')
      */
     getCurrentProvider() {
         return StateManager.getState('ui.currentProvider') || DomHelpers.getValue('llmProvider');

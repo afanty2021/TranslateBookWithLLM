@@ -243,26 +243,35 @@ export const ApiClient = {
 
     /**
      * Get available models for a provider
-     * @param {string} provider - Provider name ('ollama', 'gemini', 'openai')
-     * @param {Object} [options] - Additional options (api_endpoint, api_key)
+     * @param {string} provider - Provider name ('ollama', 'gemini', 'openai', 'openrouter')
+     * @param {Object} [options] - Additional options (apiEndpoint, apiKey)
      * @returns {Promise<Object>} Models list
      */
     async getModels(provider, options = {}) {
-        const params = new URLSearchParams();
-
-        if (provider === 'gemini' && options.apiKey) {
-            params.append('provider', 'gemini');
-            params.append('api_key', options.apiKey);
-        } else if (provider === 'openai') {
-            params.append('provider', 'openai');
-        } else {
-            // Ollama
+        if (provider === 'ollama') {
+            // Ollama: GET request (no API key needed)
+            const params = new URLSearchParams();
             if (options.apiEndpoint) {
                 params.append('api_endpoint', options.apiEndpoint);
             }
+            return await apiRequest(`/api/models?${params.toString()}`);
         }
 
-        return await apiRequest(`/api/models?${params.toString()}`);
+        // Gemini/OpenRouter/OpenAI: POST request (API key in body - more secure)
+        const body = {
+            provider: provider,
+            api_key: options.apiKey || '__USE_ENV__'
+        };
+
+        // Include endpoint for OpenAI-compatible providers (llama.cpp, LM Studio, vLLM, etc.)
+        if (provider === 'openai' && options.apiEndpoint) {
+            body.api_endpoint = options.apiEndpoint;
+        }
+
+        return await apiRequest('/api/models', {
+            method: 'POST',
+            body: JSON.stringify(body)
+        });
     },
 
     // ========================================
@@ -295,6 +304,133 @@ export const ApiClient = {
      */
     async deleteCheckpoint(translationId) {
         return await apiRequest(`/api/checkpoint/${translationId}`, {
+            method: 'DELETE'
+        });
+    },
+
+    // ========================================
+    // Settings Management
+    // ========================================
+
+    /**
+     * Get current user settings
+     * @returns {Promise<Object>} Current settings
+     */
+    async getSettings() {
+        return await apiRequest('/api/settings');
+    },
+
+    /**
+     * Save user settings to .env file
+     * @param {Object} settings - Settings to save
+     * @returns {Promise<Object>} Save result
+     */
+    async saveSettings(settings) {
+        return await apiRequest('/api/settings', {
+            method: 'POST',
+            body: JSON.stringify(settings)
+        });
+    },
+
+    // ========================================
+    // TTS (Text-to-Speech) Operations
+    // ========================================
+
+    /**
+     * Generate TTS audio from an existing file
+     * @param {Object} config - TTS configuration
+     * @param {string} config.filename - File to generate audio from
+     * @param {string} config.target_language - Target language for voice selection
+     * @param {string} [config.tts_voice] - Specific voice (auto-select if empty)
+     * @param {string} [config.tts_rate] - Speech rate (default: +0%)
+     * @param {string} [config.tts_format] - Output format (opus/mp3)
+     * @param {string} [config.tts_bitrate] - Audio bitrate
+     * @returns {Promise<Object>} TTS job info
+     */
+    async generateTTS(config) {
+        return await apiRequest('/api/tts/generate', {
+            method: 'POST',
+            body: JSON.stringify(config)
+        });
+    },
+
+    /**
+     * Get TTS job status
+     * @param {string} jobId - TTS job ID
+     * @returns {Promise<Object>} Job status
+     */
+    async getTTSStatus(jobId) {
+        return await apiRequest(`/api/tts/status/${jobId}`);
+    },
+
+    /**
+     * Get available TTS voices
+     * @returns {Promise<Object>} Available voices by language
+     */
+    async getTTSVoices() {
+        return await apiRequest('/api/tts/voices');
+    },
+
+    /**
+     * Get available TTS providers and their status
+     * @returns {Promise<Object>} Providers information
+     */
+    async getTTSProviders() {
+        return await apiRequest('/api/tts/providers');
+    },
+
+    /**
+     * Get available Chatterbox voices/languages
+     * @returns {Promise<Object>} Chatterbox languages and availability
+     */
+    async getChatterboxVoices() {
+        return await apiRequest('/api/tts/voices/chatterbox');
+    },
+
+    /**
+     * Get GPU status for TTS
+     * @returns {Promise<Object>} GPU status information
+     */
+    async getTTSGPUStatus() {
+        return await apiRequest('/api/tts/gpu-status');
+    },
+
+    /**
+     * Upload a voice prompt file for voice cloning
+     * @param {File} file - Audio file to upload
+     * @returns {Promise<Object>} Upload result with path
+     */
+    async uploadTTSVoicePrompt(file) {
+        const formData = new FormData();
+        formData.append('file', file);
+
+        const response = await fetch(`${API_BASE_URL}/api/tts/voice-prompt/upload`, {
+            method: 'POST',
+            body: formData
+        });
+
+        if (!response.ok) {
+            await handleApiError(response);
+        }
+
+        return await response.json();
+    },
+
+    /**
+     * Get list of available voice prompts
+     * @returns {Promise<Object>} Voice prompts list
+     */
+    async getTTSVoicePrompts() {
+        return await apiRequest('/api/tts/voice-prompts');
+    },
+
+    /**
+     * Delete a voice prompt file
+     * @param {string} filename - Filename to delete
+     * @returns {Promise<Object>} Delete result
+     */
+    async deleteTTSVoicePrompt(filename) {
+        return await apiRequest(`/api/tts/voice-prompt/${encodeURIComponent(filename)}`, {
             method: 'DELETE'
         });
     }

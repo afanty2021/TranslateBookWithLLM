@@ -10,6 +10,7 @@ import { ApiClient } from '../core/api-client.js';
 import { MessageLogger } from '../ui/message-logger.js';
 import { DomHelpers } from '../ui/dom-helpers.js';
 import { Validators } from '../utils/validators.js';
+import { ApiKeyUtils } from '../utils/api-key-utils.js';
 import { ProgressManager } from './progress-manager.js';
 
 /**
@@ -21,6 +22,7 @@ function earlyValidationFail(message) {
     MessageLogger.addLog(`❌ Validation failed: ${message}`);
     return false;
 }
+
 
 /**
  * Get translation configuration from form
@@ -40,6 +42,13 @@ function getTranslationConfig(file) {
 
     const provider = DomHelpers.getValue('llmProvider');
 
+    // Build prompt options object
+    const promptOptions = {
+        preserve_technical_content: DomHelpers.getElement('preserveTechnicalContent')?.checked || false,
+        text_cleanup: DomHelpers.getElement('textCleanup')?.checked || false,
+        refine: DomHelpers.getElement('refineTranslation')?.checked || false
+    };
+
     const config = {
         source_language: sourceLanguageVal,
         target_language: targetLanguageVal,
@@ -48,8 +57,9 @@ function getTranslationConfig(file) {
                          DomHelpers.getValue('openaiEndpoint') :
                          DomHelpers.getValue('apiEndpoint'),
         llm_provider: provider,
-        gemini_api_key: provider === 'gemini' ? DomHelpers.getValue('geminiApiKey') : '',
-        openai_api_key: provider === 'openai' ? DomHelpers.getValue('openaiApiKey') : '',
+        gemini_api_key: provider === 'gemini' ? ApiKeyUtils.getValue('geminiApiKey') : '',
+        openai_api_key: provider === 'openai' ? ApiKeyUtils.getValue('openaiApiKey') : '',
+        openrouter_api_key: provider === 'openrouter' ? ApiKeyUtils.getValue('openrouterApiKey') : '',
         chunk_size: parseInt(DomHelpers.getValue('chunkSize')),
         timeout: parseInt(DomHelpers.getValue('timeout')),
         context_window: parseInt(DomHelpers.getValue('contextWindow')),
@@ -57,7 +67,8 @@ function getTranslationConfig(file) {
         retry_delay: parseInt(DomHelpers.getValue('retryDelay')),
         output_filename: file.outputFilename,
         file_type: file.fileType,
-        fast_mode: DomHelpers.getElement('fastMode')?.checked || false
+        fast_mode: DomHelpers.getElement('fastMode')?.checked || false,
+        prompt_options: promptOptions
     };
 
     // Handle file input based on type
@@ -215,31 +226,18 @@ export const BatchController = {
         MessageLogger.addLog(`▶️ Starting translation for: ${fileToTranslate.name} (${fileToTranslate.fileType.toUpperCase()})`);
         updateFileStatusInList(fileToTranslate.name, 'Preparing...');
 
-        // Validate API keys for cloud providers
+        // Validate API keys for cloud providers using shared utility
         const provider = DomHelpers.getValue('llmProvider');
+        const endpoint = provider === 'openai' ? DomHelpers.getValue('openaiEndpoint') : '';
+        const apiKeyValidation = ApiKeyUtils.validateForProvider(provider, endpoint);
 
-        if (provider === 'gemini') {
-            const geminiApiKey = DomHelpers.getValue('geminiApiKey').trim();
-            if (!geminiApiKey) {
-                MessageLogger.addLog('❌ Error: Gemini API key is required when using Gemini provider');
-                MessageLogger.showMessage('Please enter your Gemini API key', 'error');
-                updateFileStatusInList(fileToTranslate.name, 'Error: Missing API key');
-                StateManager.setState('translation.currentJob', null);
-                this.processNextFileInQueue();
-                return;
-            }
-        }
-
-        if (provider === 'openai') {
-            const openaiApiKey = DomHelpers.getValue('openaiApiKey').trim();
-            if (!openaiApiKey) {
-                MessageLogger.addLog('❌ Error: OpenAI API key is required when using OpenAI provider');
-                MessageLogger.showMessage('Please enter your OpenAI API key', 'error');
-                updateFileStatusInList(fileToTranslate.name, 'Error: Missing API key');
-                StateManager.setState('translation.currentJob', null);
-                this.processNextFileInQueue();
-                return;
-            }
+        if (!apiKeyValidation.valid) {
+            MessageLogger.addLog(`❌ Error: ${apiKeyValidation.message}`);
+            MessageLogger.showMessage(apiKeyValidation.message, 'error');
+            updateFileStatusInList(fileToTranslate.name, 'Error: Missing API key');
+            StateManager.setState('translation.currentJob', null);
+            this.processNextFileInQueue();
+            return;
         }
 
         // Validate file path

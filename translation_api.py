@@ -4,6 +4,8 @@ Flask web server for translation API with WebSocket support
 import os
 import sys
 import logging
+import webbrowser
+import threading
 from datetime import datetime
 from flask import Flask
 from flask_cors import CORS
@@ -37,9 +39,12 @@ from src.api.websocket import configure_websocket_handlers
 from src.api.handlers import start_translation_job
 from src.api.translation_state import get_state_manager
 
+
 # Initialize Flask app with static folder configuration
-app = Flask(__name__, 
-            static_folder='src/web/static',
+base_path = os.getcwd()
+static_folder_path = os.path.join(base_path, 'src', 'web', 'static')
+app = Flask(__name__,
+            static_folder=static_folder_path,
             static_url_path='/static')
 CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*")
@@ -92,7 +97,7 @@ def start_job_wrapper(translation_id, config):
     start_translation_job(translation_id, config, state_manager, OUTPUT_DIR, socketio)
 
 # Configure routes and WebSocket handlers
-configure_routes(app, state_manager, OUTPUT_DIR, start_job_wrapper)
+configure_routes(app, state_manager, OUTPUT_DIR, start_job_wrapper, socketio)
 configure_websocket_handlers(socketio, state_manager)
 
 # Restore incomplete jobs from database on startup
@@ -120,6 +125,46 @@ def restore_incomplete_jobs():
 
 restore_incomplete_jobs()
 
+def open_browser(host, port):
+    """Open the web interface in the default browser after a short delay"""
+    def _open():
+        # Small delay to ensure server is ready
+        import time
+        time.sleep(1.5)
+        url = f"http://{'localhost' if host == '0.0.0.0' else host}:{port}"
+        logger.info(f"🌐 Opening browser at {url}")
+        webbrowser.open(url)
+
+    # Run in background thread to not block server startup
+    thread = threading.Thread(target=_open, daemon=True)
+    thread.start()
+
+
+def test_ollama_connection():
+    """Test Ollama connection at startup and log result"""
+    import requests
+    try:
+        base_url = DEFAULT_OLLAMA_API_ENDPOINT.split('/api/')[0]
+        tags_url = f"{base_url}/api/tags"
+        logger.info(f"🔍 Testing Ollama connection at {tags_url}...")
+        response = requests.get(tags_url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            models = [m.get('name') for m in data.get('models', [])]
+            logger.info(f"✅ Ollama connected! Found {len(models)} model(s): {models}")
+            return True
+        else:
+            logger.warning(f"⚠️ Ollama returned status {response.status_code}")
+            return False
+    except requests.exceptions.ConnectionError:
+        logger.warning(f"⚠️ Cannot connect to Ollama at {base_url}")
+        logger.warning(f"   Make sure Ollama is running ('ollama serve')")
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ Ollama connection test failed: {e}")
+        return False
+
+
 if __name__ == '__main__':
     # Validate configuration before starting
     validate_configuration()
@@ -133,6 +178,11 @@ if __name__ == '__main__':
     logger.info(f"   - Health Check: http://{HOST}:{PORT}/api/health")
     logger.info(f"   - Supported formats: .txt, .epub, and .srt")
     logger.info("")
+
+    # Test Ollama connection at startup
+    test_ollama_connection()
+
+    logger.info("")
     logger.info("💡 Press Ctrl+C to stop the server")
     logger.info("")
 
@@ -142,5 +192,8 @@ if __name__ == '__main__':
         logger.warning("   For production, use a proper WSGI server like gunicorn:")
         logger.warning("   gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:5000 translation_api:app")
         logger.info("")
+
+    # Auto-open browser (especially useful for portable executable)
+    open_browser(HOST, PORT)
 
     socketio.run(app, debug=False, host=HOST, port=PORT, allow_unsafe_werkzeug=True)

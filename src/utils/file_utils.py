@@ -4,9 +4,13 @@ File utilities for translation operations
 import os
 import asyncio
 import aiofiles
+import re
+import zipfile
 from pathlib import Path
-from src.core.text_processor import split_text_into_chunks_with_context
-from src.core.translator import translate_chunks
+from typing import Optional, Callable, Tuple
+
+from src.core.text_processor import split_text_into_chunks_with_context, split_text_into_chunks
+from src.core.translator import translate_chunks, refine_chunks
 from src.core.subtitle_translator import translate_subtitles, translate_subtitles_in_blocks
 from src.core.epub import translate_epub_file
 from src.core.srt_processor import SRTProcessor
@@ -62,9 +66,12 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
                                              progress_callback=None, log_callback=None, stats_callback=None,
                                              check_interruption_callback=None,
                                              llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
+                                             openrouter_api_key=None,
                                              context_window=2048, auto_adjust_context=True, min_chunk_size=5,
                                              fast_mode=False, checkpoint_manager=None, translation_id=None,
-                                             resume_from_index=0):
+                                             resume_from_index=0,
+                                             use_token_chunking=None, max_tokens_per_chunk=None,
+                                             soft_limit_ratio=None, prompt_options=None):
     """
     Translate a text file with callback support
 
@@ -74,13 +81,17 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
         source_language (str): Source language
         target_language (str): Target language
         model_name (str): LLM model name
-        chunk_target_lines_cli (int): Target lines per chunk
+        chunk_target_lines_cli (int): Target lines per chunk (legacy mode)
         cli_api_endpoint (str): API endpoint
         progress_callback (callable): Progress callback
         log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
         fast_mode (bool): If True, uses simplified prompts without placeholder instructions
+        use_token_chunking (bool): If True, use token-based chunking instead of line-based
+        max_tokens_per_chunk (int): Maximum tokens per chunk (token mode)
+        soft_limit_ratio (float): Soft limit ratio for token chunking (default 0.8)
+        prompt_options (dict): Optional dict with prompt customization options
     """
     if not os.path.exists(input_filepath):
         err_msg = f"ERROR: Input file '{input_filepath}' not found."
@@ -101,10 +112,17 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
             print(err_msg)
         return
 
-    if log_callback: 
+    if log_callback:
         log_callback("txt_split_start", f"Splitting text from '{source_language}'...")
 
-    structured_chunks = split_text_into_chunks_with_context(original_text, chunk_target_lines_cli)
+    # Use the new unified chunking function (token-based or line-based)
+    structured_chunks = split_text_into_chunks(
+        original_text,
+        use_token_chunking=use_token_chunking,
+        max_tokens_per_chunk=max_tokens_per_chunk,
+        soft_limit_ratio=soft_limit_ratio,
+        chunk_size=chunk_target_lines_cli
+    )
     total_chunks = len(structured_chunks)
 
     if stats_callback and total_chunks > 0:
@@ -138,7 +156,31 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
     if log_callback:
         log_callback("txt_translation_info_lang", f"Translating from {source_language} to {target_language}.")
         log_callback("txt_translation_info_chunks1", f"{total_chunks} main segments in memory.")
-        log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{chunk_target_lines_cli} lines.")
+        # Show appropriate info based on chunking mode
+        from src.config import USE_TOKEN_CHUNKING, MAX_TOKENS_PER_CHUNK
+        _use_tokens = use_token_chunking if use_token_chunking is not None else USE_TOKEN_CHUNKING
+        if _use_tokens:
+            _max_tokens = max_tokens_per_chunk if max_tokens_per_chunk is not None else MAX_TOKENS_PER_CHUNK
+            log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{_max_tokens} tokens.")
+        else:
+            log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{chunk_target_lines_cli} lines.")
+
+    # Check if refinement is enabled
+    enable_refinement = prompt_options.get('refine', False) if prompt_options else False
+
+    if log_callback:
+        log_callback("refinement_config", f"✨ Refinement pass: {'ENABLED' if enable_refinement else 'disabled'}")
+        if enable_refinement:
+            log_callback("refinement_info", "📝 Translation will use 2-pass mode: translate → refine")
+
+    # Adjust progress for refinement (translation = 0-50%, refinement = 50-100%)
+    def translation_progress(pct):
+        if progress_callback:
+            if enable_refinement:
+                # Translation is first half (0-50%)
+                progress_callback(pct * 0.5)
+            else:
+                progress_callback(pct)
 
     # Translate chunks
     translated_parts = await translate_chunks(
@@ -147,21 +189,54 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
         target_language,
         model_name,
         cli_api_endpoint,
-        progress_callback=progress_callback,
+        progress_callback=translation_progress,
         log_callback=log_callback,
         stats_callback=stats_callback,
         check_interruption_callback=check_interruption_callback,
         llm_provider=llm_provider,
         gemini_api_key=gemini_api_key,
         openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
         context_window=context_window,
         auto_adjust_context=auto_adjust_context,
         min_chunk_size=min_chunk_size,
         fast_mode=fast_mode,
         checkpoint_manager=checkpoint_manager,
         translation_id=translation_id,
-        resume_from_index=resume_from_index
+        resume_from_index=resume_from_index,
+        prompt_options=prompt_options
     )
+
+    # Refinement pass (if enabled and not interrupted)
+    # Check if translation was interrupted before starting refinement
+    was_interrupted = check_interruption_callback and check_interruption_callback()
+
+    if enable_refinement and translated_parts and not was_interrupted:
+        if log_callback:
+            log_callback("refinement_phase_start", "✨ Starting refinement pass to polish translation quality...")
+
+        translated_parts = await refine_chunks(
+            translated_chunks=translated_parts,
+            original_chunks=structured_chunks,
+            target_language=target_language,
+            model_name=model_name,
+            api_endpoint=cli_api_endpoint,
+            progress_callback=progress_callback,
+            log_callback=log_callback,
+            stats_callback=stats_callback,
+            check_interruption_callback=check_interruption_callback,
+            llm_provider=llm_provider,
+            gemini_api_key=gemini_api_key,
+            openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
+            context_window=context_window,
+            auto_adjust_context=auto_adjust_context,
+            fast_mode=fast_mode,
+            prompt_options=prompt_options
+        )
+    elif enable_refinement and was_interrupted:
+        if log_callback:
+            log_callback("refinement_skipped", "⏭️ Refinement pass skipped (translation was interrupted)")
 
     if progress_callback:
         progress_callback(100)
@@ -199,10 +274,12 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
                                            progress_callback=None, log_callback=None, stats_callback=None,
                                            check_interruption_callback=None,
                                            llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
-                                           checkpoint_manager=None, translation_id=None, resume_from_block_index=0):
+                                           openrouter_api_key=None,
+                                           checkpoint_manager=None, translation_id=None, resume_from_block_index=0,
+                                           prompt_options=None):
     """
     Translate an SRT subtitle file with callback support
-    
+
     Args:
         input_filepath (str): Path to input SRT file
         output_filepath (str): Path to output SRT file
@@ -215,7 +292,10 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
         log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
+        prompt_options (dict): Optional prompt customization options (not yet used for SRT)
     """
+    # Note: prompt_options is accepted but not yet propagated to subtitle translation
+    # SRT uses a specialized prompt (generate_subtitle_block_prompt) that doesn't use prompt_options yet
     if not os.path.exists(input_filepath):
         err_msg = f"ERROR: SRT file '{input_filepath}' not found."
         if log_callback:
@@ -302,6 +382,7 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
         llm_provider=llm_provider,
         gemini_api_key=gemini_api_key,
         openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
         checkpoint_manager=checkpoint_manager,
         translation_id=translation_id,
         resume_from_block_index=resume_from_block_index
@@ -343,8 +424,9 @@ async def translate_file(input_filepath, output_filepath,
                         progress_callback=None, log_callback=None, stats_callback=None,
                         check_interruption_callback=None,
                         llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
+                        openrouter_api_key=None,
                         context_window=2048, auto_adjust_context=True, min_chunk_size=5,
-                        fast_mode=False):
+                        fast_mode=False, prompt_options=None):
     """
     Translate a file (auto-detect format)
 
@@ -360,7 +442,10 @@ async def translate_file(input_filepath, output_filepath,
         log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
+        prompt_options (dict): Optional prompt customization options
     """
+    if prompt_options is None:
+        prompt_options = {}
     _, ext = os.path.splitext(input_filepath.lower())
 
     if ext == '.epub':
@@ -373,7 +458,9 @@ async def translate_file(input_filepath, output_filepath,
                                   llm_provider=llm_provider,
                                   gemini_api_key=gemini_api_key,
                                   openai_api_key=openai_api_key,
-                                  fast_mode=fast_mode)
+                                  openrouter_api_key=openrouter_api_key,
+                                  fast_mode=fast_mode,
+                                  prompt_options=prompt_options)
     elif ext == '.srt':
         await translate_srt_file_with_callbacks(
             input_filepath, output_filepath,
@@ -384,7 +471,9 @@ async def translate_file(input_filepath, output_filepath,
             check_interruption_callback=check_interruption_callback,
             llm_provider=llm_provider,
             gemini_api_key=gemini_api_key,
-            openai_api_key=openai_api_key
+            openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
+            prompt_options=prompt_options
         )
     else:
         # For .txt files, always use fast mode (no placeholder preservation needed)
@@ -398,8 +487,204 @@ async def translate_file(input_filepath, output_filepath,
             llm_provider=llm_provider,
             gemini_api_key=gemini_api_key,
             openai_api_key=openai_api_key,
+            openrouter_api_key=openrouter_api_key,
             context_window=context_window,
             auto_adjust_context=auto_adjust_context,
             min_chunk_size=min_chunk_size,
-            fast_mode=True
+            fast_mode=True,
+            prompt_options=prompt_options
         )
+
+
+def _extract_text_from_txt(filepath: str) -> str:
+    """Extract text from a plain text file"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def _extract_text_from_epub(filepath: str) -> str:
+    """
+    Extract readable text from an EPUB file.
+
+    Parses all HTML/XHTML content files and extracts text,
+    removing HTML tags and keeping only readable content.
+    """
+    text_parts = []
+
+    with zipfile.ZipFile(filepath, 'r') as epub:
+        for name in epub.namelist():
+            if name.endswith(('.html', '.xhtml', '.htm')):
+                try:
+                    content = epub.read(name).decode('utf-8')
+                    # Remove HTML tags
+                    clean_text = re.sub(r'<script[^>]*>.*?</script>', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    clean_text = re.sub(r'<style[^>]*>.*?</style>', '', clean_text, flags=re.DOTALL | re.IGNORECASE)
+                    clean_text = re.sub(r'<[^>]+>', ' ', clean_text)
+                    # Clean up whitespace
+                    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                    # Decode HTML entities
+                    clean_text = clean_text.replace('&nbsp;', ' ')
+                    clean_text = clean_text.replace('&amp;', '&')
+                    clean_text = clean_text.replace('&lt;', '<')
+                    clean_text = clean_text.replace('&gt;', '>')
+                    clean_text = clean_text.replace('&quot;', '"')
+                    clean_text = clean_text.replace('&#39;', "'")
+
+                    if clean_text:
+                        text_parts.append(clean_text)
+                except Exception:
+                    continue
+
+    return '\n\n'.join(text_parts)
+
+
+def _extract_text_from_srt(filepath: str) -> str:
+    """
+    Extract readable text from an SRT subtitle file.
+
+    Extracts only the subtitle text, removing timing information
+    and index numbers.
+    """
+    srt_processor = SRTProcessor()
+
+    with open(filepath, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    subtitles = srt_processor.parse_srt(content)
+
+    # Extract just the text from each subtitle
+    text_parts = [sub.get('text', '') for sub in subtitles if sub.get('text')]
+
+    return ' '.join(text_parts)
+
+
+def extract_text_from_file(filepath: str) -> str:
+    """
+    Extract readable text from a translated file.
+
+    Supports txt, epub, and srt files. Used for TTS generation
+    after translation is complete.
+
+    Args:
+        filepath: Path to the translated file
+
+    Returns:
+        Extracted text content
+
+    Raises:
+        ValueError: If file type is not supported
+        FileNotFoundError: If file doesn't exist
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found: {filepath}")
+
+    _, ext = os.path.splitext(filepath.lower())
+
+    if ext == '.txt':
+        return _extract_text_from_txt(filepath)
+    elif ext == '.epub':
+        return _extract_text_from_epub(filepath)
+    elif ext == '.srt':
+        return _extract_text_from_srt(filepath)
+    else:
+        raise ValueError(f"Unsupported file type for TTS: {ext}")
+
+
+async def generate_tts_for_translation(
+    translated_filepath: str,
+    target_language: str,
+    tts_config: 'TTSConfig',
+    log_callback: Optional[Callable] = None,
+    progress_callback: Optional[Callable] = None
+) -> Tuple[bool, str, Optional[str]]:
+    """
+    Generate TTS audio from a translated file.
+
+    Extracts text from the translated file (txt, epub, or srt),
+    then generates audio using the configured TTS provider.
+
+    Args:
+        translated_filepath: Path to the translated file
+        target_language: Target language (for voice selection)
+        tts_config: TTS configuration object
+        log_callback: Optional logging callback
+        progress_callback: Optional progress callback
+
+    Returns:
+        Tuple of (success: bool, message: str, audio_path: Optional[str])
+    """
+    from src.tts.tts_config import TTSConfig
+    from src.tts.audio_processor import generate_tts_for_text
+
+    if log_callback:
+        log_callback("tts_start", f"Starting TTS generation for: {translated_filepath}")
+
+    # Generate output audio path
+    base, _ = os.path.splitext(translated_filepath)
+    audio_extension = tts_config.get_output_extension()
+    audio_path = f"{base}_audio{audio_extension}"
+
+    # Ensure unique path
+    audio_path = get_unique_output_path(audio_path)
+
+    try:
+        # Extract text from translated file
+        if log_callback:
+            log_callback("tts_extract", "Extracting text from translated file...")
+
+        text = extract_text_from_file(translated_filepath)
+
+        if not text.strip():
+            return False, "No text found in translated file", None
+
+        text_length = len(text)
+        if log_callback:
+            log_callback("tts_text_extracted", f"Extracted {text_length:,} characters for TTS")
+
+        # Set target language in config
+        tts_config.target_language = target_language
+
+        # Create progress wrapper for TTS
+        def tts_progress(current, total, message):
+            if log_callback:
+                log_callback("tts_progress", f"TTS: {message} ({current}/{total})")
+            if progress_callback:
+                # Pass all arguments to the callback
+                progress_callback(current, total, message)
+
+        # Generate audio
+        if log_callback:
+            log_callback("tts_synthesize", f"Synthesizing audio with voice: {tts_config.get_effective_voice(target_language)}")
+
+        success, message = await generate_tts_for_text(
+            text=text,
+            output_path=audio_path,
+            config=tts_config,
+            language=target_language,
+            progress_callback=tts_progress
+        )
+
+        if success:
+            if log_callback:
+                log_callback("tts_complete", f"TTS audio saved: {audio_path}")
+            return True, message, audio_path
+        else:
+            if log_callback:
+                log_callback("tts_error", f"TTS generation failed: {message}")
+            return False, message, None
+
+    except FileNotFoundError as e:
+        error_msg = f"Translated file not found: {e}"
+        if log_callback:
+            log_callback("tts_error", error_msg)
+        return False, error_msg, None
+    except ValueError as e:
+        error_msg = f"Unsupported file type: {e}"
+        if log_callback:
+            log_callback("tts_error", error_msg)
+        return False, error_msg, None
+    except Exception as e:
+        error_msg = f"TTS generation error: {e}"
+        if log_callback:
+            log_callback("tts_error", error_msg)
+        return False, error_msg, None

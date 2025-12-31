@@ -10,3 +10,10 @@ CLAUDE.md
 .spec-workflow/
 /docs
 /venv
+OPENROUTER_INTEGRATION_PLAN.md
+build_installer.bat
+build/
+/dist
+/wiki/
+.wiki_repo/
+/prompt_optimization_results

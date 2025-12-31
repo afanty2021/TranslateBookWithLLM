@@ -5,9 +5,10 @@ import os
 import argparse
 import asyncio
 
-from src.config import DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT, LLM_PROVIDER, GEMINI_API_KEY, OPENAI_API_KEY, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
-from src.utils.file_utils import translate_file, get_unique_output_path
+from src.config import DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT, LLM_PROVIDER, GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
+from src.utils.file_utils import translate_file, get_unique_output_path, generate_tts_for_translation
 from src.utils.unified_logger import setup_cli_logger, LogType
+from src.tts.tts_config import TTSConfig, TTS_ENABLED, TTS_VOICE, TTS_RATE, TTS_BITRATE, TTS_OUTPUT_FORMAT
 
 
 if __name__ == "__main__":
@@ -18,12 +19,28 @@ if __name__ == "__main__":
     parser.add_argument("-tl", "--target_lang", default=DEFAULT_TARGET_LANGUAGE, help=f"Target language (default: {DEFAULT_TARGET_LANGUAGE}).")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"LLM model (default: {DEFAULT_MODEL}).")
     parser.add_argument("-cs", "--chunksize", type=int, default=MAIN_LINES_PER_CHUNK, help=f"Target lines per chunk (default: {MAIN_LINES_PER_CHUNK}).")
-    parser.add_argument("--api_endpoint", default=API_ENDPOINT, help=f"API endpoint for Ollama or OpenAI compatible provider (default: {API_ENDPOINT}).")
-    parser.add_argument("--provider", default=LLM_PROVIDER, choices=["ollama", "gemini", "openai"], help=f"LLM provider to use (default: {LLM_PROVIDER}).")
+    parser.add_argument("--api_endpoint", default=API_ENDPOINT, help=f"API endpoint for Ollama or OpenAI-compatible servers (llama.cpp, LM Studio, vLLM, etc.) (default: {API_ENDPOINT}).")
+    parser.add_argument("--provider", default=LLM_PROVIDER, choices=["ollama", "gemini", "openai", "openrouter"], help=f"LLM provider (default: {LLM_PROVIDER}). Use 'openai' for any OpenAI-compatible server.")
     parser.add_argument("--gemini_api_key", default=GEMINI_API_KEY, help="Google Gemini API key (required if using gemini provider).")
-    parser.add_argument("--openai_api_key", default=OPENAI_API_KEY, help="OpenAI API key (required if using openai provider).")
+    parser.add_argument("--openai_api_key", default=OPENAI_API_KEY, help="OpenAI API key (required for OpenAI cloud, not needed for local servers).")
+    parser.add_argument("--openrouter_api_key", default=OPENROUTER_API_KEY, help="OpenRouter API key (required if using openrouter provider).")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
     parser.add_argument("--fast-mode", action="store_true", help="Use fast mode for EPUB (strips formatting, maximum compatibility).")
+    parser.add_argument("--no-images", action="store_true", help="Disable image preservation in fast mode (images will be stripped).")
+
+    # Prompt options (optional system prompt instructions)
+    prompt_group = parser.add_argument_group('Prompt Options', 'Optional instructions to include in the translation prompt')
+    prompt_group.add_argument("--preserve-technical", action="store_true", help="Preserve technical content (code, paths, URLs) without translation.")
+    prompt_group.add_argument("--text-cleanup", action="store_true", help="Enable OCR/typographic cleanup (fix broken lines, spacing, punctuation).")
+    prompt_group.add_argument("--refine", action="store_true", help="Enable refinement pass: runs a second pass to polish translation quality and literary style.")
+
+    # TTS (Text-to-Speech) arguments
+    tts_group = parser.add_argument_group('TTS Options', 'Text-to-Speech audio generation')
+    tts_group.add_argument("--tts", action="store_true", default=TTS_ENABLED, help="Generate audio from translated text using Edge-TTS.")
+    tts_group.add_argument("--tts-voice", default=TTS_VOICE, help="TTS voice name (auto-selected based on target language if not specified).")
+    tts_group.add_argument("--tts-rate", default=TTS_RATE, help="TTS speech rate adjustment, e.g. '+10%%' or '-20%%' (default: %(default)s).")
+    tts_group.add_argument("--tts-bitrate", default=TTS_BITRATE, help="Audio bitrate for encoding, e.g. '64k', '96k' (default: %(default)s).")
+    tts_group.add_argument("--tts-format", default=TTS_OUTPUT_FORMAT, choices=["opus", "mp3"], help="Audio output format (default: %(default)s).")
 
     args = parser.parse_args()
 
@@ -55,6 +72,8 @@ if __name__ == "__main__":
         parser.error("--gemini_api_key is required when using gemini provider")
     if args.provider == "openai" and not args.openai_api_key:
         parser.error("--openai_api_key is required when using openai provider")
+    if args.provider == "openrouter" and not args.openrouter_api_key:
+        parser.error("--openrouter_api_key is required when using openrouter provider")
 
     # Check for small models (<=12B) and recommend fast mode for EPUB
     if file_type == "EPUB" and not args.fast_mode:
@@ -116,6 +135,19 @@ if __name__ == "__main__":
     # Create legacy callback for backward compatibility
     log_callback = logger.create_legacy_callback()
 
+    # Handle --no-images flag by modifying the config
+    if args.no_images:
+        import src.config as config_module
+        config_module.FAST_MODE_PRESERVE_IMAGES = False
+        logger.info("Image preservation disabled", LogType.INFO, {'preserve_images': False})
+
+    # Build prompt_options from CLI arguments
+    prompt_options = {
+        'preserve_technical_content': args.preserve_technical,
+        'text_cleanup': args.text_cleanup,
+        'refine': args.refine
+    }
+
     try:
         asyncio.run(translate_file(
             args.input,
@@ -132,14 +164,44 @@ if __name__ == "__main__":
             llm_provider=args.provider,
             gemini_api_key=args.gemini_api_key,
             openai_api_key=args.openai_api_key,
-            fast_mode=args.fast_mode
+            openrouter_api_key=args.openrouter_api_key,
+            fast_mode=args.fast_mode,
+            prompt_options=prompt_options
         ))
-        
+
         # Log successful completion
         logger.info("Translation Completed Successfully", LogType.TRANSLATION_END, {
             'output_file': args.output
         })
-        
+
+        # TTS Generation (if enabled)
+        if args.tts:
+            logger.info("Starting TTS Generation", LogType.INFO, {
+                'voice': args.tts_voice or 'auto',
+                'rate': args.tts_rate,
+                'format': args.tts_format
+            })
+
+            # Create TTS config from CLI arguments
+            tts_config = TTSConfig.from_cli_args(args)
+
+            # Generate audio from translated file
+            success, message, audio_path = asyncio.run(generate_tts_for_translation(
+                translated_filepath=args.output,
+                target_language=args.target_lang,
+                tts_config=tts_config,
+                log_callback=log_callback
+            ))
+
+            if success:
+                logger.info("TTS Generation Completed", LogType.INFO, {
+                    'audio_file': audio_path
+                })
+            else:
+                logger.error(f"TTS generation failed: {message}", LogType.ERROR_DETAIL, {
+                    'details': message
+                })
+
     except Exception as e:
         logger.error(f"Translation failed: {str(e)}", LogType.ERROR_DETAIL, {
             'details': str(e),

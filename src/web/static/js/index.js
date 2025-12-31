@@ -11,6 +11,7 @@
 import { StateManager } from './core/state-manager.js';
 import { ApiClient } from './core/api-client.js';
 import { WebSocketManager } from './core/websocket-manager.js';
+import { SettingsManager } from './core/settings-manager.js';
 
 // ========================================
 // UI Modules
@@ -44,6 +45,88 @@ import { ResumeManager } from './translation/resume-manager.js';
 // ========================================
 import { Validators } from './utils/validators.js';
 import { LifecycleManager } from './utils/lifecycle-manager.js';
+
+// ========================================
+// TTS Modules
+// ========================================
+import { TTSManager } from './tts/tts-manager.js';
+
+// ========================================
+// TTS Event Handler
+// ========================================
+
+/**
+ * Handle TTS update events from WebSocket
+ * @param {Object} data - TTS update data
+ */
+function handleTtsUpdate(data) {
+    const { status, progress, message, audio_filename, error, current_chunk, total_chunks } = data;
+
+    // Update TTS progress section
+    const ttsProgressSection = DomHelpers.getElement('ttsProgressSection');
+    const ttsProgressBar = DomHelpers.getElement('ttsProgressBar');
+    const ttsStatusText = DomHelpers.getElement('ttsStatusText');
+
+    switch (status) {
+        case 'started':
+            // Show TTS progress section
+            if (ttsProgressSection) {
+                ttsProgressSection.style.display = 'block';
+            }
+            if (ttsProgressBar) {
+                ttsProgressBar.style.width = '0%';
+                ttsProgressBar.textContent = '0%';
+            }
+            if (ttsStatusText) {
+                ttsStatusText.textContent = '🔊 Starting audio generation...';
+            }
+            MessageLogger.addLog('🔊 TTS generation started');
+            break;
+
+        case 'processing':
+            if (ttsProgressBar) {
+                ttsProgressBar.style.width = `${progress}%`;
+                ttsProgressBar.textContent = `${progress}%`;
+            }
+            if (ttsStatusText) {
+                const chunkInfo = current_chunk && total_chunks
+                    ? ` (${current_chunk}/${total_chunks})`
+                    : '';
+                ttsStatusText.textContent = `🔊 ${message || 'Generating audio...'}${chunkInfo}`;
+            }
+            break;
+
+        case 'completed':
+            if (ttsProgressBar) {
+                ttsProgressBar.style.width = '100%';
+                ttsProgressBar.textContent = '100%';
+            }
+            if (ttsStatusText) {
+                ttsStatusText.textContent = `✅ Audio generated: ${audio_filename || 'audio file'}`;
+            }
+            MessageLogger.addLog(`✅ TTS completed: ${audio_filename || 'audio file'}`);
+
+            // Auto-hide after 5 seconds
+            setTimeout(() => {
+                if (ttsProgressSection) {
+                    ttsProgressSection.style.display = 'none';
+                }
+            }, 5000);
+            break;
+
+        case 'failed':
+            if (ttsProgressBar) {
+                ttsProgressBar.style.width = '0%';
+                ttsProgressBar.textContent = 'Failed';
+                ttsProgressBar.style.background = '#ef4444';
+            }
+            if (ttsStatusText) {
+                ttsStatusText.textContent = `❌ TTS failed: ${error || message || 'Unknown error'}`;
+            }
+            MessageLogger.addLog(`❌ TTS failed: ${error || message || 'Unknown error'}`);
+            break;
+    }
+}
 
 // ========================================
 // Global State Initialization
@@ -142,6 +225,11 @@ function wireModuleEvents() {
         ResumeManager.loadResumableJobs();
     });
 
+    // TTS update events
+    WebSocketManager.on('tts_update', (data) => {
+        handleTtsUpdate(data);
+    });
+
     // State changes -> update UI
     StateManager.subscribe('translation.isBatchActive', (isActive) => {
         const translateBtn = DomHelpers.getElement('translateBtn');
@@ -175,6 +263,7 @@ function initializeModules() {
     // 1. Core infrastructure
     initializeState();
     WebSocketManager.connect();
+    SettingsManager.initialize();
 
     // 2. UI modules
     FormManager.initialize();
@@ -192,10 +281,13 @@ function initializeModules() {
     ProgressManager.reset();
     ResumeManager.initialize();
 
-    // 6. Lifecycle management
+    // 6. TTS Manager
+    TTSManager.initialize();
+
+    // 7. Lifecycle management
     LifecycleManager.initialize();
 
-    // 7. Wire up events
+    // 8. Wire up events
     wireModuleEvents();
 
     console.log('✅ Application initialized successfully');
@@ -229,6 +321,7 @@ window.resetFiles = () => {
 
 // Form Manager
 window.toggleAdvanced = FormManager.toggleAdvanced.bind(FormManager);
+window.togglePromptOptions = FormManager.togglePromptOptions.bind(FormManager);
 window.checkCustomSourceLanguage = (element) => FormManager.checkCustomSourceLanguage(element);
 window.checkCustomTargetLanguage = (element) => FormManager.checkCustomTargetLanguage(element);
 window.resetForm = FormManager.resetForm.bind(FormManager);
@@ -269,6 +362,42 @@ window.loadResumableJobs = ResumeManager.loadResumableJobs.bind(ResumeManager);
 // Provider Manager
 window.refreshModels = ProviderManager.refreshModels.bind(ProviderManager);
 
+// Settings Manager
+window.saveSettings = async () => {
+    const saveBtn = DomHelpers.getElement('saveSettingsBtn');
+    const statusSpan = DomHelpers.getElement('saveSettingsStatus');
+
+    if (saveBtn) {
+        saveBtn.disabled = true;
+        DomHelpers.setText(saveBtn, '💾 Saving...');
+    }
+
+    try {
+        const result = await SettingsManager.saveAllSettings(true);
+        if (result.success) {
+            if (statusSpan) {
+                statusSpan.textContent = '✅ Settings saved!';
+                statusSpan.style.color = '#059669';
+                setTimeout(() => { statusSpan.textContent = ''; }, 3000);
+            }
+            MessageLogger.addLog(`Settings saved: ${result.savedToEnv?.join(', ') || 'local preferences'}`);
+        } else {
+            throw new Error(result.error || 'Unknown error');
+        }
+    } catch (error) {
+        if (statusSpan) {
+            statusSpan.textContent = `❌ ${error.message}`;
+            statusSpan.style.color = '#dc2626';
+        }
+        MessageLogger.addLog(`Failed to save settings: ${error.message}`, 'error');
+    } finally {
+        if (saveBtn) {
+            saveBtn.disabled = false;
+            DomHelpers.setText(saveBtn, '💾 Save Settings');
+        }
+    }
+};
+
 // Message Logger
 window.clearActivityLog = MessageLogger.clearLog.bind(MessageLogger);
 
@@ -280,6 +409,327 @@ window.toggleSelectAll = FileManager.toggleSelectAll.bind(FileManager);
 
 // File manager functions (exposed in file-manager.js)
 // window.toggleFileSelection, downloadSingleFile, deleteSingleFile, openLocalFile
+
+// TTS Manager functions
+window.refreshTTSProviders = TTSManager.loadProvidersInfo.bind(TTSManager);
+window.refreshGPUStatus = TTSManager.loadGPUStatus.bind(TTSManager);
+window.deleteVoicePrompt = TTSManager.deleteVoicePrompt.bind(TTSManager);
+
+// ========================================
+// TTS (Audiobook) Generation
+// ========================================
+
+/**
+ * Show TTS configuration modal and start audiobook generation
+ * @param {string} filename - File to generate audio from
+ * @param {string} filepath - Full path to the file
+ */
+window.createAudiobook = async function(filename, filepath) {
+    // Show TTS modal
+    showTTSModal(filename, filepath);
+};
+
+/**
+ * Show TTS configuration modal with provider selection
+ */
+async function showTTSModal(filename, filepath) {
+    // Remove existing modal if present
+    const existingModal = document.getElementById('ttsModal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+
+    // Get providers info and voice prompts
+    let providersInfo = {};
+    let voicePrompts = [];
+    let gpuStatus = { cuda_available: false };
+
+    try {
+        [providersInfo, voicePrompts, gpuStatus] = await Promise.all([
+            ApiClient.getTTSProviders().catch(() => ({ providers: {} })),
+            ApiClient.getTTSVoicePrompts().catch(() => ({ voice_prompts: [] })),
+            ApiClient.getTTSGPUStatus().catch(() => ({ cuda_available: false }))
+        ]);
+        providersInfo = providersInfo.providers || {};
+        voicePrompts = voicePrompts.voice_prompts || [];
+    } catch (e) {
+        console.error('Failed to load TTS info:', e);
+    }
+
+    const isChatterboxAvailable = providersInfo.chatterbox?.available || false;
+
+    // Build voice prompts options
+    const voicePromptsOptions = voicePrompts.map(vp =>
+        `<option value="${DomHelpers.escapeHtml(vp.path)}">${DomHelpers.escapeHtml(vp.filename)}</option>`
+    ).join('');
+
+    // Create modal HTML with provider selection
+    const modalHtml = `
+        <div id="ttsModal" class="modal-overlay">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>🎧 Generate Audiobook</h3>
+                    <button class="close-btn" id="ttsModalClose">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <p style="margin: 0 0 20px 0; color: #a3adb3; font-size: 14px;">
+                        Generate audio narration for: <strong style="color: #79CDDE;">${DomHelpers.escapeHtml(filename)}</strong>
+                    </p>
+
+                    <!-- Provider Selection -->
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px;">
+                        <div class="form-group" style="margin-bottom: 0;">
+                            <label style="font-size: 13px;">TTS Provider</label>
+                            <select id="ttsModalProvider" class="form-control" style="font-size: 13px;">
+                                <option value="edge-tts">Edge TTS (Cloud)</option>
+                                <option value="chatterbox" ${!isChatterboxAvailable ? 'disabled' : ''}>
+                                    Chatterbox TTS ${!isChatterboxAvailable ? '(Not Available)' : '(Local GPU)'}
+                                </option>
+                            </select>
+                        </div>
+
+                        <!-- GPU Status (shown when Chatterbox selected) -->
+                        <div id="ttsModalGpuStatus" class="form-group" style="margin-bottom: 0; display: none;">
+                            <label style="font-size: 13px;">GPU Status</label>
+                            <div class="gpu-status ${gpuStatus.cuda_available ? 'gpu-available' : 'gpu-unavailable'}">
+                                <span class="status-dot ${gpuStatus.cuda_available ? 'available' : 'unavailable'}"></span>
+                                <span>${gpuStatus.cuda_available ? (gpuStatus.gpu_name || 'CUDA GPU') : 'CPU Mode'}</span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Edge-TTS Options -->
+                    <div id="ttsModalEdgeOptions">
+                        <div style="display: grid; gap: 15px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Target Language</label>
+                                <select id="ttsModalLanguage" class="form-control" style="font-size: 13px;">
+                                    <option value="Chinese">Chinese</option>
+                                    <option value="English">English</option>
+                                    <option value="French">French</option>
+                                    <option value="Spanish">Spanish</option>
+                                    <option value="German">German</option>
+                                    <option value="Italian">Italian</option>
+                                    <option value="Japanese">Japanese</option>
+                                    <option value="Korean">Korean</option>
+                                    <option value="Portuguese">Portuguese</option>
+                                    <option value="Russian">Russian</option>
+                                </select>
+                            </div>
+
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Voice (optional)</label>
+                                <input type="text" id="ttsModalVoice" class="form-control" placeholder="e.g., zh-CN-XiaoxiaoNeural" style="font-size: 13px;">
+                                <small style="color: #6b7280;">Leave empty for auto-selection based on language</small>
+                            </div>
+
+                            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label style="font-size: 13px;">Speech Rate</label>
+                                    <select id="ttsModalRate" class="form-control" style="font-size: 13px;">
+                                        <option value="-20%">Slower (-20%)</option>
+                                        <option value="-10%">Slightly slower (-10%)</option>
+                                        <option value="+0%" selected>Normal</option>
+                                        <option value="+10%">Slightly faster (+10%)</option>
+                                        <option value="+20%">Faster (+20%)</option>
+                                        <option value="+30%">Much faster (+30%)</option>
+                                    </select>
+                                </div>
+
+                                <div class="form-group" style="margin-bottom: 0;">
+                                    <label style="font-size: 13px;">Audio Format</label>
+                                    <select id="ttsModalFormat" class="form-control" style="font-size: 13px;">
+                                        <option value="opus" selected>Opus (compact)</option>
+                                        <option value="mp3">MP3 (compatible)</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Audio Bitrate</label>
+                                <select id="ttsModalBitrate" class="form-control" style="font-size: 13px;">
+                                    <option value="48k">48k (smaller file)</option>
+                                    <option value="64k" selected>64k (balanced)</option>
+                                    <option value="96k">96k (higher quality)</option>
+                                    <option value="128k">128k (best quality)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Chatterbox Options (hidden by default) -->
+                    <div id="ttsModalChatterboxOptions" style="display: none;">
+                        <div style="background: #2a2a2a; border-radius: 8px; padding: 15px; margin-bottom: 15px; border: 1px solid #fbbf24;">
+                            <h4 style="margin: 0 0 12px 0; font-size: 14px; color: #fbbf24;">🎤 Voice Cloning</h4>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Voice Prompt</label>
+                                <select id="ttsModalVoicePrompt" class="form-control" style="font-size: 13px;">
+                                    <option value="">Default voice (no cloning)</option>
+                                    ${voicePromptsOptions}
+                                </select>
+                                <small style="color: #6b7280;">Select a previously uploaded voice sample</small>
+                            </div>
+                        </div>
+
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">
+                                    Exaggeration <span id="ttsModalExaggerationValue" style="color: #fbbf24;">0.50</span>
+                                </label>
+                                <input type="range" id="ttsModalExaggeration" min="0" max="1" step="0.05" value="0.5" class="tts-slider">
+                                <small style="color: #6b7280;">Higher = more expressive</small>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">
+                                    CFG Weight <span id="ttsModalCfgValue" style="color: #fbbf24;">0.50</span>
+                                </label>
+                                <input type="range" id="ttsModalCfgWeight" min="0" max="1" step="0.05" value="0.5" class="tts-slider">
+                                <small style="color: #6b7280;">Prompt adherence</small>
+                            </div>
+                        </div>
+
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Target Language</label>
+                                <select id="ttsModalChatterboxLang" class="form-control" style="font-size: 13px;">
+                                    <option value="en">English</option>
+                                    <option value="zh">Chinese</option>
+                                    <option value="es">Spanish</option>
+                                    <option value="fr">French</option>
+                                    <option value="de">German</option>
+                                    <option value="it">Italian</option>
+                                    <option value="ja">Japanese</option>
+                                    <option value="ko">Korean</option>
+                                    <option value="pt">Portuguese</option>
+                                    <option value="ru">Russian</option>
+                                </select>
+                            </div>
+                            <div class="form-group" style="margin-bottom: 0;">
+                                <label style="font-size: 13px;">Audio Format</label>
+                                <select id="ttsModalChatterboxFormat" class="form-control" style="font-size: 13px;">
+                                    <option value="wav">WAV (lossless)</option>
+                                    <option value="mp3" selected>MP3 (compatible)</option>
+                                    <option value="opus">Opus (compact)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="modal-footer">
+                    <button id="ttsModalCancel" class="btn btn-secondary">Cancel</button>
+                    <button id="ttsModalGenerate" class="btn btn-primary" style="background: linear-gradient(135deg, #22c55e 0%, #16a34a 100%);">
+                        🎧 Generate Audio
+                    </button>
+                </div>
+            </div>
+        </div>
+    `;
+
+    // Add modal to DOM
+    document.body.insertAdjacentHTML('beforeend', modalHtml);
+
+    // Get modal elements
+    const modal = document.getElementById('ttsModal');
+    const closeBtn = document.getElementById('ttsModalClose');
+    const cancelBtn = document.getElementById('ttsModalCancel');
+    const generateBtn = document.getElementById('ttsModalGenerate');
+    const providerSelect = document.getElementById('ttsModalProvider');
+    const edgeOptions = document.getElementById('ttsModalEdgeOptions');
+    const chatterboxOptions = document.getElementById('ttsModalChatterboxOptions');
+    const gpuStatusDiv = document.getElementById('ttsModalGpuStatus');
+
+    // Slider value updates
+    const exaggerationSlider = document.getElementById('ttsModalExaggeration');
+    const cfgSlider = document.getElementById('ttsModalCfgWeight');
+    const exaggerationValue = document.getElementById('ttsModalExaggerationValue');
+    const cfgValue = document.getElementById('ttsModalCfgValue');
+
+    if (exaggerationSlider && exaggerationValue) {
+        exaggerationSlider.addEventListener('input', () => {
+            exaggerationValue.textContent = parseFloat(exaggerationSlider.value).toFixed(2);
+        });
+    }
+    if (cfgSlider && cfgValue) {
+        cfgSlider.addEventListener('input', () => {
+            cfgValue.textContent = parseFloat(cfgSlider.value).toFixed(2);
+        });
+    }
+
+    // Provider change handler
+    providerSelect.addEventListener('change', () => {
+        const isChatterbox = providerSelect.value === 'chatterbox';
+        edgeOptions.style.display = isChatterbox ? 'none' : 'block';
+        chatterboxOptions.style.display = isChatterbox ? 'block' : 'none';
+        gpuStatusDiv.style.display = isChatterbox ? 'block' : 'none';
+    });
+
+    // Close handlers
+    const closeModal = () => modal.remove();
+    closeBtn.addEventListener('click', closeModal);
+    cancelBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    const handleEscape = (e) => {
+        if (e.key === 'Escape') {
+            closeModal();
+            document.removeEventListener('keydown', handleEscape);
+        }
+    };
+    document.addEventListener('keydown', handleEscape);
+
+    // Generate audio
+    generateBtn.addEventListener('click', async () => {
+        const provider = providerSelect.value;
+
+        // Build config based on provider
+        let config = {
+            filename: filename,
+            tts_provider: provider
+        };
+
+        if (provider === 'edge-tts') {
+            config.target_language = document.getElementById('ttsModalLanguage').value;
+            config.tts_voice = document.getElementById('ttsModalVoice').value;
+            config.tts_rate = document.getElementById('ttsModalRate').value;
+            config.tts_format = document.getElementById('ttsModalFormat').value;
+            config.tts_bitrate = document.getElementById('ttsModalBitrate').value;
+        } else {
+            // Chatterbox
+            config.target_language = document.getElementById('ttsModalChatterboxLang').value;
+            config.tts_voice_prompt_path = document.getElementById('ttsModalVoicePrompt').value;
+            config.tts_exaggeration = parseFloat(document.getElementById('ttsModalExaggeration').value);
+            config.tts_cfg_weight = parseFloat(document.getElementById('ttsModalCfgWeight').value);
+            config.tts_format = document.getElementById('ttsModalChatterboxFormat').value;
+        }
+
+        // Disable button and show loading
+        generateBtn.disabled = true;
+        generateBtn.textContent = '⏳ Starting...';
+
+        try {
+            const result = await ApiClient.generateTTS(config);
+
+            MessageLogger.showMessage(`TTS generation started for ${filename}`, 'success');
+            MessageLogger.addLog(`🎧 Started audiobook generation (${provider}): ${filename} (Job ID: ${result.job_id})`);
+
+            // Close modal
+            closeModal();
+
+            // Show TTS progress section
+            const ttsProgressSection = DomHelpers.getElement('ttsProgressSection');
+            if (ttsProgressSection) {
+                ttsProgressSection.style.display = 'block';
+            }
+
+        } catch (error) {
+            MessageLogger.showMessage(`Error starting TTS: ${error.message}`, 'error');
+            generateBtn.disabled = false;
+            generateBtn.textContent = '🎧 Generate Audio';
+        }
+    });
+}
 
 // ========================================
 // API Endpoint Configuration
@@ -312,6 +762,7 @@ export {
     StateManager,
     ApiClient,
     WebSocketManager,
+    SettingsManager,
     DomHelpers,
     MessageLogger,
     FormManager,
@@ -324,5 +775,6 @@ export {
     ProgressManager,
     ResumeManager,
     Validators,
-    LifecycleManager
+    LifecycleManager,
+    TTSManager
 };

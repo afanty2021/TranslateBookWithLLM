@@ -27,7 +27,11 @@ class TranslationStateManager:
                     'start_time': time.time(),
                     'total_chunks': 0,
                     'completed_chunks': 0,
-                    'failed_chunks': 0
+                    'failed_chunks': 0,
+                    # OpenRouter cost tracking
+                    'openrouter_cost': 0.0,
+                    'openrouter_prompt_tokens': 0,
+                    'openrouter_completion_tokens': 0
                 },
                 'logs': [f"[{datetime.now().strftime('%H:%M:%S')}] Translation {translation_id} queued."],
                 'result': None,
@@ -67,8 +71,8 @@ class TranslationStateManager:
         with self._lock:
             if translation_id not in self._translations:
                 return None
-            # Return a copy to prevent external modification
-            return self._translations[translation_id].copy()
+            # Return a deep copy to prevent external modification of nested objects
+            return copy.deepcopy(self._translations[translation_id])
     
     def get_translation_field(self, translation_id: str, field: str, default=None):
         """Get a specific field from translation state"""
@@ -111,9 +115,9 @@ class TranslationStateManager:
             return translation_id in self._translations
     
     def get_all_translations(self) -> Dict[str, Dict[str, Any]]:
-        """Get all translations (returns a copy)"""
+        """Get all translations (returns a deep copy)"""
         with self._lock:
-            return self._translations.copy()
+            return copy.deepcopy(self._translations)
     
     def get_translation_summaries(self) -> list:
         """Get summaries of all translations for listing"""

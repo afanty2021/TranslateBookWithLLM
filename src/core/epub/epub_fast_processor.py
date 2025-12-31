@@ -32,37 +32,65 @@ from lxml import etree
 from datetime import datetime
 import aiofiles
 
-from src.config import NAMESPACES, DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT, SENTENCE_TERMINATORS, TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT
-from ..text_processor import split_text_into_chunks_with_context
+from src.config import (
+    NAMESPACES, DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT,
+    SENTENCE_TERMINATORS, TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT,
+    FAST_MODE_PRESERVE_IMAGES, IMAGE_MARKER_PREFIX, IMAGE_MARKER_SUFFIX,
+    FAST_MODE_PRESERVE_FORMATTING, FORMAT_ITALIC_START, FORMAT_ITALIC_END,
+    FORMAT_BOLD_START, FORMAT_BOLD_END, FORMAT_HR_MARKER
+)
+from ..text_processor import split_text_into_chunks
 from ..translator import translate_chunks
 
+# Supported image media types for EPUB
+IMAGE_MEDIA_TYPES = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/svg+xml': '.svg',
+    'image/webp': '.webp'
+}
 
-async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tuple[str, dict]:
+
+async def extract_pure_text_from_epub(
+    epub_path: str,
+    log_callback=None,
+    preserve_images: bool = None
+) -> tuple[str, dict, list]:
     """
     Extract 100% pure text from EPUB (production-ready).
 
     Strips ALL HTML/XML tags, structure, and formatting - returns only readable text.
+    Optionally preserves images by inserting markers and collecting image data.
     Handles malformed EPUBs gracefully and extracts maximum content.
 
     Args:
         epub_path: Path to input EPUB file (must exist and be a valid ZIP)
         log_callback: Optional logging callback function(event_type, message)
+        preserve_images: Whether to extract and preserve images (default: FAST_MODE_PRESERVE_IMAGES from config)
 
     Returns:
-        tuple: (extracted_text, metadata_dict)
-            - extracted_text: Pure text content (no markup, no tags, no structure)
+        tuple: (extracted_text, metadata_dict, images_list)
+            - extracted_text: Pure text content with optional image markers
             - metadata_dict: Dict with keys: title, author, language, identifier
+            - images_list: List of dicts with keys: id, filename, data (bytes), media_type, alt
 
     Raises:
         FileNotFoundError: If EPUB file doesn't exist
         zipfile.BadZipFile: If file is not a valid ZIP/EPUB
         ValueError: If EPUB structure is invalid (no OPF file found)
     """
+    if preserve_images is None:
+        preserve_images = FAST_MODE_PRESERVE_IMAGES
+
     if not os.path.exists(epub_path):
         raise FileNotFoundError(f"EPUB file not found: {epub_path}")
 
     if log_callback:
-        log_callback("fast_mode_extraction_start", "Fast mode: Extracting pure text from EPUB")
+        msg = "Fast mode: Extracting pure text from EPUB"
+        if preserve_images:
+            msg += " (preserving images)"
+        log_callback("fast_mode_extraction_start", msg)
 
     metadata = {
         'title': 'Untitled',
@@ -72,6 +100,8 @@ async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tupl
     }
 
     all_text_parts = []
+    all_images = []  # Collected images: {id, filename, data, media_type, alt}
+    image_counter = [0]  # Use list for mutable counter in nested function
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -128,7 +158,7 @@ async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tupl
             if manifest is None or spine is None:
                 raise ValueError("Invalid EPUB structure: No manifest or spine found in OPF")
 
-            # Build ID to href mapping
+            # Build ID to href mapping for content files
             id_to_href = {}
             for item in manifest.findall('.//opf:item', namespaces=NAMESPACES):
                 item_id = item.get('id')
@@ -145,11 +175,18 @@ async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tupl
                 if idref and idref in id_to_href:
                     href = id_to_href[idref]
                     content_path = os.path.join(opf_dir, href)
+                    content_dir = os.path.dirname(content_path)
 
                     if os.path.exists(content_path):
                         try:
-                            # Extract pure text (no titles, no structure markers)
-                            pure_text = await _extract_pure_text_from_xhtml(content_path)
+                            # Extract pure text with optional image markers
+                            pure_text = await _extract_pure_text_from_xhtml(
+                                content_path,
+                                preserve_images=preserve_images,
+                                images_list=all_images,
+                                image_counter=image_counter,
+                                content_dir=content_dir
+                            )
                             if pure_text.strip():
                                 all_text_parts.append(pure_text.strip())
                         except Exception as e:
@@ -166,10 +203,12 @@ async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tupl
             raise ValueError("No text content could be extracted from EPUB")
 
         if log_callback:
-            log_callback("fast_mode_extraction_complete",
-                        f"Fast mode: Extracted {len(full_text)} characters of pure text")
+            msg = f"Fast mode: Extracted {len(full_text)} characters of pure text"
+            if preserve_images and all_images:
+                msg += f" and {len(all_images)} images"
+            log_callback("fast_mode_extraction_complete", msg)
 
-        return full_text, metadata
+        return full_text, metadata, all_images
 
     except (FileNotFoundError, zipfile.BadZipFile, ValueError):
         # Re-raise known errors
@@ -179,16 +218,27 @@ async def extract_pure_text_from_epub(epub_path: str, log_callback=None) -> tupl
         raise RuntimeError(f"Unexpected error during EPUB text extraction: {e}") from e
 
 
-async def _extract_pure_text_from_xhtml(xhtml_path: str) -> str:
+async def _extract_pure_text_from_xhtml(
+    xhtml_path: str,
+    preserve_images: bool = False,
+    images_list: list = None,
+    image_counter: list = None,
+    content_dir: str = None
+) -> str:
     """
     Extract 100% pure text from XHTML file - RADICAL APPROACH.
     Removes ALL tags, ALL structure, ALL formatting.
+    Optionally preserves images by inserting markers and collecting image data.
 
     Args:
         xhtml_path: Path to XHTML/HTML file
+        preserve_images: Whether to extract images and insert markers
+        images_list: List to append image data to (modified in place)
+        image_counter: Mutable counter [n] for unique image IDs
+        content_dir: Directory containing the XHTML file (for resolving relative image paths)
 
     Returns:
-        str: Pure text content only
+        str: Pure text content with optional image markers
     """
     async with aiofiles.open(xhtml_path, 'r', encoding='utf-8') as f:
         content = await f.read()
@@ -201,22 +251,34 @@ async def _extract_pure_text_from_xhtml(xhtml_path: str) -> str:
         parser = etree.HTMLParser()
         tree = etree.fromstring(content.encode('utf-8'), parser)
 
-    # Remove script and style elements completely
-    for element in tree.xpath('.//script | .//style', namespaces=NAMESPACES):
+    # Remove non-content elements completely (script, style, head, link, meta)
+    # Using local-name() to match elements regardless of namespace
+    # This is critical for Fast Mode: we only want actual readable text content
+    non_content_tags = ('script', 'style', 'head', 'link', 'meta', 'title')
+    xpath_conditions = ' or '.join(f'local-name()="{tag}"' for tag in non_content_tags)
+    for element in tree.xpath(f'.//*[{xpath_conditions}]'):
         parent = element.getparent()
         if parent is not None:
             parent.remove(element)
 
     # Extract text from body (or whole tree if no body)
-    body = tree.xpath('.//body', namespaces=NAMESPACES)
+    # Using local-name() to match regardless of namespace
+    body = tree.xpath('.//*[local-name()="body"]')
     if body:
         text_root = body[0]
     else:
         text_root = tree
 
-    # Recursively extract ALL text
+    # Recursively extract ALL text (with optional image handling)
     text_parts = []
-    _extract_text_recursive(text_root, text_parts)
+    _extract_text_recursive(
+        text_root,
+        text_parts,
+        preserve_images=preserve_images,
+        images_list=images_list,
+        image_counter=image_counter,
+        content_dir=content_dir
+    )
 
     # Join and clean up text
     plain_text = "\n".join(text_parts)
@@ -232,16 +294,28 @@ async def _extract_pure_text_from_xhtml(xhtml_path: str) -> str:
     return plain_text.strip()
 
 
-def _extract_text_recursive(element, text_parts: list):
+def _extract_text_recursive(
+    element,
+    text_parts: list,
+    preserve_images: bool = False,
+    images_list: list = None,
+    image_counter: list = None,
+    content_dir: str = None
+):
     """
     Recursively extract text from element and its children.
 
     Block-level elements accumulate their inline content with spaces,
     then add the complete block as a single text part.
+    Images are optionally extracted and replaced with markers.
 
     Args:
         element: lxml element
         text_parts: List to append text to
+        preserve_images: Whether to extract images and insert markers
+        images_list: List to append image data to
+        image_counter: Mutable counter [n] for unique image IDs
+        content_dir: Directory for resolving relative image paths
     """
     # Block-level tags that should add paragraph breaks
     block_tags = {
@@ -260,13 +334,45 @@ def _extract_text_recursive(element, text_parts: list):
 
     tag_lower = tag.lower()
 
+    # Handle image elements
+    if tag_lower == 'img' and preserve_images and images_list is not None and image_counter is not None:
+        image_marker = _extract_image(element, images_list, image_counter, content_dir)
+        if image_marker:
+            text_parts.append('')  # Paragraph break before image
+            text_parts.append(image_marker)
+            text_parts.append('')  # Paragraph break after image
+        return
+
+    # Handle SVG elements (sometimes used for images)
+    if tag_lower == 'svg' and preserve_images:
+        # Skip SVG content entirely (too complex to preserve)
+        return
+
+    # Handle horizontal rules - preserve as marker
+    if tag_lower == 'hr' and FAST_MODE_PRESERVE_FORMATTING:
+        text_parts.append('')  # Paragraph break before
+        text_parts.append(FORMAT_HR_MARKER)
+        text_parts.append('')  # Paragraph break after
+        return
+
     # If this is a block element, accumulate all inline content with spaces
     if tag_lower in block_tags:
         inline_parts = []
-        _extract_inline_text(element, inline_parts)
+        _extract_inline_text(
+            element,
+            inline_parts,
+            preserve_images=preserve_images,
+            images_list=images_list,
+            image_counter=image_counter,
+            content_dir=content_dir
+        )
+        # Join parts, preserving newlines from <br/> tags
+        # First join with spaces, then clean up spaces around newlines
         block_text = ' '.join(inline_parts)
-        # Clean up multiple spaces
-        block_text = ' '.join(block_text.split())
+        # Clean up multiple spaces (but preserve newlines)
+        block_text = re.sub(r'[^\S\n]+', ' ', block_text)  # Replace non-newline whitespace with single space
+        block_text = re.sub(r' *\n *', '\n', block_text)   # Remove spaces around newlines
+        block_text = block_text.strip()
         if block_text:
             text_parts.append(block_text)
             text_parts.append('')  # Empty string creates paragraph break
@@ -280,7 +386,14 @@ def _extract_text_recursive(element, text_parts: list):
 
         # Process children
         for child in element:
-            _extract_text_recursive(child, text_parts)
+            _extract_text_recursive(
+                child,
+                text_parts,
+                preserve_images=preserve_images,
+                images_list=images_list,
+                image_counter=image_counter,
+                content_dir=content_dir
+            )
 
             # Handle tail text (text after child element)
             if hasattr(child, 'tail') and child.tail:
@@ -289,17 +402,106 @@ def _extract_text_recursive(element, text_parts: list):
                     text_parts.append(tail)
 
 
-def _extract_inline_text(element, inline_parts: list):
+def _extract_inline_text(
+    element,
+    inline_parts: list,
+    preserve_images: bool = False,
+    images_list: list = None,
+    image_counter: list = None,
+    content_dir: str = None,
+    preserve_formatting: bool = None
+):
     """
     Extract all text from an element and its children as inline content.
 
     This accumulates text without adding paragraph breaks, suitable for
     gathering all content within a block-level element.
+    Images within inline content are extracted and marked.
+    Line breaks (<br/>) are preserved as newline characters.
+    Formatting tags (em, i, strong, b) are preserved as markers.
 
     Args:
         element: lxml element
         inline_parts: List to append text parts to
+        preserve_images: Whether to extract images and insert markers
+        images_list: List to append image data to
+        image_counter: Mutable counter [n] for unique image IDs
+        content_dir: Directory for resolving relative image paths
+        preserve_formatting: Whether to preserve italic/bold formatting (default from config)
     """
+    if preserve_formatting is None:
+        preserve_formatting = FAST_MODE_PRESERVE_FORMATTING
+
+    # Get tag name without namespace
+    tag = element.tag
+    if isinstance(tag, str) and '}' in tag:
+        tag = tag.split('}', 1)[1]
+    tag_lower = tag.lower() if isinstance(tag, str) else ''
+
+    # Handle line breaks - preserve them as newlines
+    if tag_lower == 'br':
+        inline_parts.append('\n')
+        # Also handle tail text after <br/>
+        if hasattr(element, 'tail') and element.tail:
+            tail = element.tail.strip()
+            if tail:
+                inline_parts.append(tail)
+        return
+
+    # Handle inline images
+    if tag_lower == 'img' and preserve_images and images_list is not None and image_counter is not None:
+        image_marker = _extract_image(element, images_list, image_counter, content_dir)
+        if image_marker:
+            inline_parts.append(image_marker)
+        return
+
+    # Handle formatting tags (italic and bold) - wrap content with markers
+    if preserve_formatting and tag_lower in ('em', 'i'):
+        inline_parts.append(FORMAT_ITALIC_START)
+        # Process content inside the formatting tag
+        if hasattr(element, 'text') and element.text:
+            text = element.text.strip()
+            if text:
+                inline_parts.append(text)
+        for child in element:
+            _extract_inline_text(
+                child, inline_parts,
+                preserve_images=preserve_images,
+                images_list=images_list,
+                image_counter=image_counter,
+                content_dir=content_dir,
+                preserve_formatting=preserve_formatting
+            )
+            if hasattr(child, 'tail') and child.tail:
+                tail = child.tail.strip()
+                if tail:
+                    inline_parts.append(tail)
+        inline_parts.append(FORMAT_ITALIC_END)
+        return
+
+    if preserve_formatting and tag_lower in ('strong', 'b'):
+        inline_parts.append(FORMAT_BOLD_START)
+        # Process content inside the formatting tag
+        if hasattr(element, 'text') and element.text:
+            text = element.text.strip()
+            if text:
+                inline_parts.append(text)
+        for child in element:
+            _extract_inline_text(
+                child, inline_parts,
+                preserve_images=preserve_images,
+                images_list=images_list,
+                image_counter=image_counter,
+                content_dir=content_dir,
+                preserve_formatting=preserve_formatting
+            )
+            if hasattr(child, 'tail') and child.tail:
+                tail = child.tail.strip()
+                if tail:
+                    inline_parts.append(tail)
+        inline_parts.append(FORMAT_BOLD_END)
+        return
+
     # Handle element text
     if hasattr(element, 'text') and element.text:
         text = element.text.strip()
@@ -308,13 +510,242 @@ def _extract_inline_text(element, inline_parts: list):
 
     # Process children recursively
     for child in element:
-        _extract_inline_text(child, inline_parts)
+        _extract_inline_text(
+            child,
+            inline_parts,
+            preserve_images=preserve_images,
+            images_list=images_list,
+            image_counter=image_counter,
+            content_dir=content_dir,
+            preserve_formatting=preserve_formatting
+        )
 
         # Handle tail text (text after child element)
         if hasattr(child, 'tail') and child.tail:
             tail = child.tail.strip()
             if tail:
                 inline_parts.append(tail)
+
+
+def _extract_image(
+    element,
+    images_list: list,
+    image_counter: list,
+    content_dir: str
+) -> str:
+    """
+    Extract image data from an img element and return a marker.
+
+    Captures all display attributes (width, height, style, class) to restore
+    them in the output EPUB without passing them through the LLM.
+
+    Args:
+        element: lxml img element
+        images_list: List to append image data to (modified in place)
+        image_counter: Mutable counter [n] for unique image IDs
+        content_dir: Directory for resolving relative image paths
+
+    Returns:
+        str: Image marker string (e.g., "⟦IMG:001⟧") or empty string if extraction failed
+    """
+    # Get image source
+    src = element.get('src')
+    if not src:
+        # Try xlink:href (used in some EPUBs)
+        src = element.get('{http://www.w3.org/1999/xlink}href')
+    if not src:
+        return ''
+
+    # Skip data URIs (too large to handle efficiently)
+    if src.startswith('data:'):
+        return ''
+
+    # Resolve relative path
+    if content_dir and not os.path.isabs(src):
+        # Handle URL-encoded paths
+        from urllib.parse import unquote
+        src_decoded = unquote(src)
+        image_path = os.path.normpath(os.path.join(content_dir, src_decoded))
+    else:
+        image_path = src
+
+    # Check if file exists
+    if not os.path.exists(image_path):
+        return ''
+
+    # Determine media type from extension
+    ext = os.path.splitext(image_path)[1].lower()
+    media_type = None
+    for mt, extension in IMAGE_MEDIA_TYPES.items():
+        if extension == ext:
+            media_type = mt
+            break
+
+    if not media_type:
+        # Try to guess from common extensions
+        ext_to_media = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.svg': 'image/svg+xml',
+            '.webp': 'image/webp'
+        }
+        media_type = ext_to_media.get(ext)
+
+    if not media_type:
+        return ''
+
+    # Read image data
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+    except Exception:
+        return ''
+
+    # Generate unique ID
+    image_id = f"{image_counter[0]:03d}"
+    image_counter[0] += 1
+
+    # Get alt text
+    alt = element.get('alt', '')
+
+    # Generate filename for output
+    original_filename = os.path.basename(image_path)
+    filename = f"image_{image_id}{ext}"
+
+    # Extract display attributes (width, height, style, class)
+    # These are preserved and restored without passing through the LLM
+    width = element.get('width', '')
+    height = element.get('height', '')
+    style = element.get('style', '')
+    css_class = element.get('class', '')
+
+    # Add to images list with display attributes
+    images_list.append({
+        'id': image_id,
+        'filename': filename,
+        'original_filename': original_filename,
+        'data': image_data,
+        'media_type': media_type,
+        'alt': alt,
+        # Display attributes (preserved for output)
+        'width': width,
+        'height': height,
+        'style': style,
+        'class': css_class
+    })
+
+    # Return marker
+    return f"{IMAGE_MARKER_PREFIX}{image_id}{IMAGE_MARKER_SUFFIX}"
+
+
+def has_image_markers(text: str) -> bool:
+    """
+    Check if text contains any image markers.
+
+    Args:
+        text: Text that may contain image markers (e.g., "[IMG001]")
+
+    Returns:
+        bool: True if text contains at least one image marker
+    """
+    marker_pattern = re.compile(
+        re.escape(IMAGE_MARKER_PREFIX) + r'\s*\d+\s*' + re.escape(IMAGE_MARKER_SUFFIX)
+    )
+    return bool(marker_pattern.search(text))
+
+
+def _build_img_attributes(image_info: dict, is_inline: bool = False) -> str:
+    """
+    Build HTML attributes string for an image tag, including preserved display attributes.
+
+    Args:
+        image_info: Dict with image data including width, height, style, class
+        is_inline: Whether this is an inline image (affects default class)
+
+    Returns:
+        String of HTML attributes (e.g., 'width="100" height="50" style="..."')
+    """
+    import html as html_module
+
+    attrs = []
+
+    # Add preserved width/height attributes
+    width = image_info.get('width', '')
+    height = image_info.get('height', '')
+    if width:
+        attrs.append(f'width="{html_module.escape(width)}"')
+    if height:
+        attrs.append(f'height="{html_module.escape(height)}"')
+
+    # Add preserved style attribute
+    style = image_info.get('style', '')
+    if style:
+        attrs.append(f'style="{html_module.escape(style)}"')
+
+    # Handle class: combine preserved class with our class if needed
+    css_class = image_info.get('class', '')
+    if is_inline:
+        # For inline images, add our inline-image class
+        if css_class:
+            combined_class = f"{css_class} inline-image"
+        else:
+            combined_class = "inline-image"
+        attrs.append(f'class="{html_module.escape(combined_class)}"')
+    elif css_class:
+        # For block images, only use original class if present
+        attrs.append(f'class="{html_module.escape(css_class)}"')
+
+    return ' '.join(attrs)
+
+
+def replace_image_markers_in_text(text: str, images_by_id: dict) -> str:
+    """
+    Replace ALL image markers in text with HTML img tags.
+
+    This function finds and replaces image markers anywhere in the text,
+    not just when they are isolated paragraphs. It handles:
+    - Markers on their own line: [IMG001]
+    - Markers with spaces: [IMG 001] or [ IMG001 ]
+    - Markers inline with text: "Here is [IMG001] the image"
+    - Markers with surrounding punctuation: ([IMG001]) or "[IMG001]"
+
+    Preserves original display attributes (width, height, style, class).
+
+    Args:
+        text: Text containing image markers (e.g., "[IMG001]")
+        images_by_id: Dict mapping image IDs to image info dicts
+
+    Returns:
+        Text with all image markers replaced by HTML img tags
+    """
+    if not images_by_id:
+        return text
+
+    # Pattern to match image markers with optional whitespace inside
+    # Matches: [IMG001], [IMG 001], [ IMG001], [IMG001 ], etc.
+    marker_pattern = re.compile(
+        re.escape(IMAGE_MARKER_PREFIX) + r'\s*(\d+)\s*' + re.escape(IMAGE_MARKER_SUFFIX)
+    )
+
+    def replace_marker(match):
+        """Replace a single marker with its HTML representation."""
+        image_id = match.group(1)
+        image_info = images_by_id.get(image_id)
+
+        if not image_info:
+            # Image not found - keep the marker visible for debugging
+            return match.group(0)
+
+        filename = image_info['filename']
+        extra_attrs = _build_img_attributes(image_info, is_inline=True)
+        if extra_attrs:
+            return f'<img src="images/{filename}" alt="" {extra_attrs}/>'
+        else:
+            return f'<img src="images/{filename}" alt="" class="inline-image"/>'
+
+    return marker_pattern.sub(replace_marker, text)
 
 
 def _clean_translation_tags(text: str) -> str:
@@ -350,23 +781,39 @@ def _clean_translation_tags(text: str) -> str:
     return text.strip()
 
 
-async def create_simple_epub(translated_text: str, output_path: str, metadata: dict,
-                            target_language: str, log_callback=None) -> None:
+async def create_simple_epub(
+    translated_text: str,
+    output_path: str,
+    metadata: dict,
+    target_language: str,
+    log_callback=None,
+    images: list = None
+) -> None:
     """
-    Create a standard, generic EPUB 3.0 from translated pure text - RADICAL APPROACH.
+    Create a standard, generic EPUB 2.0 from translated pure text - RADICAL APPROACH.
 
     Splits text into readable chapters (auto-pagination by size).
-    Creates a clean, valid EPUB structure.
+    Creates a clean, valid EPUB structure with optional images.
 
     Args:
-        translated_text: Pure translated text (no markup)
+        translated_text: Pure translated text (may contain image markers)
         output_path: Path for output EPUB file
         metadata: Dictionary with title, author, language, identifier
         target_language: Target language code
         log_callback: Optional logging callback
+        images: Optional list of image dicts with keys: id, filename, data, media_type, alt
     """
+    if images is None:
+        images = []
+
     if log_callback:
-        log_callback("fast_mode_rebuild_start", "Fast mode: Building generic EPUB from translated text")
+        msg = "Fast mode: Building generic EPUB from translated text"
+        if images:
+            msg += f" with {len(images)} images"
+        log_callback("fast_mode_rebuild_start", msg)
+
+    # Build image lookup by ID for quick access
+    images_by_id = {img['id']: img for img in images}
 
     # Split text into chapters (auto-pagination by word count)
     chapters = _auto_split_into_chapters(translated_text, words_per_chapter=5000)
@@ -380,6 +827,11 @@ async def create_simple_epub(translated_text: str, output_path: str, metadata: d
         meta_inf_dir = os.path.join(temp_dir, 'META-INF')
         os.makedirs(meta_inf_dir, exist_ok=True)
 
+        # Create images directory if we have images
+        if images:
+            images_dir = os.path.join(temp_dir, 'images')
+            os.makedirs(images_dir, exist_ok=True)
+
         # Create mimetype file (MUST be first and uncompressed)
         mimetype_path = os.path.join(temp_dir, 'mimetype')
         async with aiofiles.open(mimetype_path, 'w', encoding='utf-8') as f:
@@ -391,14 +843,20 @@ async def create_simple_epub(translated_text: str, output_path: str, metadata: d
         async with aiofiles.open(container_path, 'w', encoding='utf-8') as f:
             await f.write(container_xml)
 
-        # Create CSS file (clean, readable style)
-        css_content = _create_simple_css()
+        # Create CSS file (clean, readable style with image support)
+        css_content = _create_simple_css(with_images=bool(images))
         css_path = os.path.join(temp_dir, 'stylesheet.css')
         async with aiofiles.open(css_path, 'w', encoding='utf-8') as f:
             await f.write(css_content)
 
         # Update metadata with target language BEFORE creating chapters
         metadata['language'] = target_language.lower()[:2] if target_language else metadata.get('language', 'en')
+
+        # Write image files
+        for img in images:
+            img_path = os.path.join(temp_dir, 'images', img['filename'])
+            async with aiofiles.open(img_path, 'wb') as f:
+                await f.write(img['data'])
 
         # Create chapter XHTML files
         chapter_files = []
@@ -410,14 +868,19 @@ async def create_simple_epub(translated_text: str, output_path: str, metadata: d
             chapter_text_cleaned = _clean_translation_tags(chapter_text)
 
             chapter_title = f'Chapter {i}'
-            xhtml_content = _create_chapter_xhtml(chapter_title, chapter_text_cleaned, metadata['language'])
+            xhtml_content = _create_chapter_xhtml(
+                chapter_title,
+                chapter_text_cleaned,
+                metadata['language'],
+                images_by_id=images_by_id
+            )
             xhtml_path = os.path.join(temp_dir, filename)
             # Write with proper UTF-8 encoding (no newline parameter for Windows compatibility)
             async with aiofiles.open(xhtml_path, 'w', encoding='utf-8') as f:
                 await f.write(xhtml_content)
 
         # Create content.opf (package document) - EPUB 2.0 format
-        opf_content = _create_content_opf(metadata, chapter_files)
+        opf_content = _create_content_opf(metadata, chapter_files, images=images)
         opf_path = os.path.join(temp_dir, 'content.opf')
         async with aiofiles.open(opf_path, 'w', encoding='utf-8') as f:
             await f.write(opf_content)
@@ -445,6 +908,11 @@ async def create_simple_epub(translated_text: str, output_path: str, metadata: d
             # Add CSS
             epub_zip.write(css_path, 'stylesheet.css')
 
+            # Add images
+            for img in images:
+                img_path = os.path.join(temp_dir, 'images', img['filename'])
+                epub_zip.write(img_path, f"images/{img['filename']}")
+
             # Add chapter files in order
             for i, chapter_text in enumerate(chapters, 1):
                 filename = f'chapter_{i:03d}.xhtml'
@@ -453,8 +921,11 @@ async def create_simple_epub(translated_text: str, output_path: str, metadata: d
                     epub_zip.write(xhtml_path, filename)
 
     if log_callback:
-        log_callback("fast_mode_epub_created",
-                    f"Fast mode: EPUB created successfully with {len(chapters)} chapters at {output_path}")
+        msg = f"Fast mode: EPUB created successfully with {len(chapters)} chapters"
+        if images:
+            msg += f" and {len(images)} images"
+        msg += f" at {output_path}"
+        log_callback("fast_mode_epub_created", msg)
 
 
 def _auto_split_into_chapters(text: str, words_per_chapter: int = 5000) -> list[str]:
@@ -521,9 +992,9 @@ def _create_container_xml() -> str:
 </container>'''
 
 
-def _create_simple_css() -> str:
-    """Create simple, readable CSS."""
-    return '''body {
+def _create_simple_css(with_images: bool = False) -> str:
+    """Create simple, readable CSS with optional image styling."""
+    base_css = '''body {
     font-family: Georgia, serif;
     line-height: 1.6;
     margin: 2em;
@@ -545,24 +1016,129 @@ p {
 
 p:first-of-type {
     text-indent: 0;
+}
+
+hr {
+    border: none;
+    border-top: 1px solid #ccc;
+    margin: 2em auto;
+    width: 50%;
+}
+
+em, i {
+    font-style: italic;
+}
+
+strong, b {
+    font-weight: bold;
 }'''
 
+    if with_images:
+        base_css += '''
 
-def _create_chapter_xhtml(title: str, text: str, language: str = 'en') -> str:
+.image-container {
+    text-align: center;
+    margin: 1.5em 0;
+    page-break-inside: avoid;
+}
+
+.image-container img {
+    max-width: 100%;
+    height: auto;
+    display: block;
+    margin: 0 auto;
+}
+
+.image-caption {
+    font-size: 0.9em;
+    color: #666;
+    font-style: italic;
+    margin-top: 0.5em;
+    text-align: center;
+    text-indent: 0;
+}
+
+/* Inline images within paragraphs */
+.inline-image {
+    max-height: 1.5em;
+    vertical-align: middle;
+    display: inline;
+    margin: 0 0.2em;
+}
+
+/* Larger inline images (standalone in paragraph) */
+p > img.inline-image:only-child {
+    max-width: 100%;
+    max-height: none;
+    display: block;
+    margin: 0.5em auto;
+}'''
+
+    return base_css
+
+
+def _convert_formatting_markers_to_html(text: str) -> str:
+    """
+    Convert formatting markers to HTML tags.
+
+    Converts:
+    - [I]text[/I] -> <em>text</em>
+    - [B]text[/B] -> <strong>text</strong>
+    - [HR] -> <hr/>
+
+    This is done AFTER HTML escaping, so the markers are still plain text.
+
+    Args:
+        text: Text with formatting markers (already HTML-escaped)
+
+    Returns:
+        Text with markers converted to HTML tags
+    """
+    # Convert italic markers
+    text = text.replace(FORMAT_ITALIC_START, '<em>')
+    text = text.replace(FORMAT_ITALIC_END, '</em>')
+
+    # Convert bold markers
+    text = text.replace(FORMAT_BOLD_START, '<strong>')
+    text = text.replace(FORMAT_BOLD_END, '</strong>')
+
+    return text
+
+
+def _is_hr_marker(text: str) -> bool:
+    """Check if text is only a horizontal rule marker."""
+    return text.strip() == FORMAT_HR_MARKER
+
+
+def _create_chapter_xhtml(
+    title: str,
+    text: str,
+    language: str = 'en',
+    images_by_id: dict = None
+) -> str:
     """
     Create XHTML content for a chapter - EPUB 2.0 format (like working EPUBs).
 
+    Handles image markers in three ways:
+    1. Isolated markers (paragraph is only "[IMG001]") -> full image container div
+    2. Inline markers (text contains "[IMG001]") -> inline img tag within paragraph
+    3. Markers with spaces/variations -> normalized and replaced
+
     Args:
         title: Chapter title
-        text: Chapter text content
+        text: Chapter text content (may contain image markers)
         language: Language code (e.g., 'en', 'fr')
+        images_by_id: Dict mapping image IDs to image info dicts
 
     Returns:
         Complete XHTML string
     """
-    # Escape HTML special characters
-    import html
-    title_escaped = html.escape(title) if title else "Chapter"
+    import html as html_module
+
+    if images_by_id is None:
+        images_by_id = {}
+
+    title_escaped = html_module.escape(title) if title else "Chapter"
 
     # Ensure we have text
     text = text.strip() if text else "No content."
@@ -572,15 +1148,40 @@ def _create_chapter_xhtml(title: str, text: str, language: str = 'en') -> str:
     for para in text.split('\n\n'):
         para_stripped = para.strip()
         if para_stripped:
-            # Escape HTML and preserve line breaks within paragraphs
-            para_escaped = html.escape(para_stripped)
-            # Replace single newlines with spaces
-            para_escaped = para_escaped.replace('\n', ' ')
-            paragraphs.append(f'    <p>{para_escaped}</p>')
+            # Check if this paragraph is ONLY a horizontal rule marker
+            if _is_hr_marker(para_stripped):
+                paragraphs.append('    <hr/>')
+                continue
+
+            # Check if this paragraph is ONLY an image marker (isolated image)
+            image_html = _convert_image_marker_to_html(para_stripped, images_by_id)
+            if image_html:
+                # Isolated image marker -> use full container div
+                paragraphs.append(image_html)
+            else:
+                # Check if paragraph contains any image markers (inline images)
+                if has_image_markers(para_stripped) and images_by_id:
+                    # First escape HTML, then replace markers with img tags
+                    # We need to be careful: escape first, but markers should not be escaped
+                    # Solution: replace markers with placeholders, escape, then restore
+                    para_with_images = _process_paragraph_with_inline_images(
+                        para_stripped, images_by_id
+                    )
+                    # Convert formatting markers to HTML
+                    para_with_images = _convert_formatting_markers_to_html(para_with_images)
+                    paragraphs.append(f'    <p>{para_with_images}</p>')
+                else:
+                    # No image markers - standard text paragraph
+                    para_escaped = html_module.escape(para_stripped)
+                    # Replace single newlines with <br/> for line breaks (preserves text breathing)
+                    para_escaped = para_escaped.replace('\n', '<br/>\n')
+                    # Convert formatting markers to HTML
+                    para_escaped = _convert_formatting_markers_to_html(para_escaped)
+                    paragraphs.append(f'    <p>{para_escaped}</p>')
 
     # If no paragraphs were created, create at least one
     if not paragraphs:
-        paragraphs.append(f'    <p>{html.escape(text)}</p>')
+        paragraphs.append(f'    <p>{html_module.escape(text)}</p>')
 
     paragraphs_html = '\n'.join(paragraphs)
 
@@ -599,19 +1200,125 @@ def _create_chapter_xhtml(title: str, text: str, language: str = 'en') -> str:
 </html>'''
 
 
-def _create_content_opf(metadata: dict, chapter_files: list) -> str:
+def _process_paragraph_with_inline_images(text: str, images_by_id: dict) -> str:
+    """
+    Process a paragraph that contains inline image markers.
+
+    Escapes HTML in the text while preserving and converting image markers
+    to proper img tags. Preserves original display attributes.
+
+    Args:
+        text: Paragraph text with image markers
+        images_by_id: Dict mapping image IDs to image info dicts
+
+    Returns:
+        HTML-safe paragraph content with img tags
+    """
+    import html as html_module
+
+    # Pattern to match image markers with optional whitespace inside
+    marker_pattern = re.compile(
+        re.escape(IMAGE_MARKER_PREFIX) + r'\s*(\d+)\s*' + re.escape(IMAGE_MARKER_SUFFIX)
+    )
+
+    # Split text by image markers, keeping the markers
+    parts = marker_pattern.split(text)
+    # parts will be: [text_before, id1, text_between, id2, text_after, ...]
+
+    result_parts = []
+    i = 0
+    while i < len(parts):
+        if i % 2 == 0:
+            # This is text content - escape it
+            text_part = parts[i]
+            if text_part:
+                escaped = html_module.escape(text_part)
+                # Replace single newlines with <br/> for line breaks
+                escaped = escaped.replace('\n', '<br/>\n')
+                result_parts.append(escaped)
+        else:
+            # This is an image ID - convert to img tag
+            image_id = parts[i]
+            image_info = images_by_id.get(image_id)
+            if image_info:
+                filename = image_info['filename']
+                extra_attrs = _build_img_attributes(image_info, is_inline=True)
+                if extra_attrs:
+                    result_parts.append(f'<img src="images/{filename}" alt="" {extra_attrs}/>')
+                else:
+                    result_parts.append(f'<img src="images/{filename}" alt="" class="inline-image"/>')
+            else:
+                # Image not found - keep the original marker (escaped)
+                result_parts.append(html_module.escape(f"{IMAGE_MARKER_PREFIX}{image_id}{IMAGE_MARKER_SUFFIX}"))
+        i += 1
+
+    return ''.join(result_parts)
+
+
+def _convert_image_marker_to_html(text: str, images_by_id: dict) -> str:
+    """
+    Convert an image marker to HTML img tag for block-level display.
+
+    Preserves original display attributes (width, height, style, class).
+
+    Args:
+        text: Text that may be an image marker (e.g., "[IMG001]")
+        images_by_id: Dict mapping image IDs to image info dicts
+
+    Returns:
+        HTML string for the image, or empty string if not an image marker
+    """
+    # Normalize text: remove all whitespace (LLM sometimes adds spaces inside markers)
+    # e.g., "[IMG 005]" -> "[IMG005]"
+    normalized_text = re.sub(r'\s+', '', text.strip())
+
+    # Check if text is an image marker
+    marker_pattern = re.compile(
+        re.escape(IMAGE_MARKER_PREFIX) + r'(\d+)' + re.escape(IMAGE_MARKER_SUFFIX)
+    )
+    match = marker_pattern.fullmatch(normalized_text)
+
+    if not match:
+        return ''
+
+    image_id = match.group(1)
+    image_info = images_by_id.get(image_id)
+
+    if not image_info:
+        return ''
+
+    filename = image_info['filename']
+
+    # Build attributes from preserved display settings
+    extra_attrs = _build_img_attributes(image_info, is_inline=False)
+    if extra_attrs:
+        img_tag = f'<img src="images/{filename}" alt="" {extra_attrs}/>'
+    else:
+        img_tag = f'<img src="images/{filename}" alt=""/>'
+
+    # Create image HTML with container div for styling (no caption)
+    return f'''    <div class="image-container">
+      {img_tag}
+    </div>'''
+
+
+def _create_content_opf(metadata: dict, chapter_files: list, images: list = None) -> str:
     """
     Create content.opf file content with translation signature.
 
     Args:
         metadata: Dictionary with title, author, language, identifier
         chapter_files: List of chapter filenames
+        images: Optional list of image dicts with keys: id, filename, media_type
 
     Returns:
         Complete OPF XML string
     """
     import html
     from src.config import SIGNATURE_ENABLED, PROJECT_NAME, PROJECT_GITHUB
+
+    if images is None:
+        images = []
 
     title = html.escape(metadata.get('title', 'Untitled'))
     author = html.escape(metadata.get('author', 'Unknown'))
@@ -627,6 +1334,13 @@ def _create_content_opf(metadata: dict, chapter_files: list) -> str:
         )
     manifest_items.append('    <item id="css" href="stylesheet.css" media-type="text/css"/>')
     manifest_items.append('    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>')
+
+    # Add images to manifest
+    for img in images:
+        img_id = f"img{img['id']}"
+        img_href = f"images/{img['filename']}"
+        media_type = img['media_type']
+        manifest_items.append(f'    <item id="{img_id}" href="{img_href}" media-type="{media_type}"/>')
 
     manifest_xml = '\n'.join(manifest_items)
 
@@ -725,12 +1439,15 @@ async def translate_text_as_string(
     llm_provider: str = "ollama",
     gemini_api_key=None,
     openai_api_key=None,
+    openrouter_api_key=None,
     context_window: int = 2048,
     auto_adjust_context: bool = True,
     min_chunk_size: int = 5,
     checkpoint_manager=None,
     translation_id: str = None,
-    resume_from_index: int = 0
+    resume_from_index: int = 0,
+    has_images: bool = False,
+    prompt_options: dict = None
 ) -> str:
     """
     Translate a text string using the standard text translation workflow.
@@ -758,6 +1475,8 @@ async def translate_text_as_string(
         checkpoint_manager: Checkpoint manager for resume functionality
         translation_id: ID of the translation job
         resume_from_index: Index to resume from
+        has_images: If True, includes image placeholder preservation instructions in prompts
+        prompt_options: Optional dict with prompt customization options
 
     Returns:
         Translated text string
@@ -766,8 +1485,8 @@ async def translate_text_as_string(
         log_callback("fast_mode_text_translation_start",
                     f"Fast mode: Translating text from {source_language} to {target_language}")
 
-    # Split text into chunks
-    structured_chunks = split_text_into_chunks_with_context(text, chunk_target_lines)
+    # Split text into chunks (uses token-based or line-based based on config)
+    structured_chunks = split_text_into_chunks(text)
     total_chunks = len(structured_chunks)
 
     if stats_callback and total_chunks > 0:
@@ -793,7 +1512,8 @@ async def translate_text_as_string(
                     f"Fast mode: Translating {total_chunks} chunks")
 
     # Translate chunks using the standard text translation workflow
-    # IMPORTANT: Pass fast_mode=True to use simplified prompts without placeholder instructions
+    # IMPORTANT: Pass fast_mode=True to use simplified prompts without HTML/XML placeholder instructions
+    # If has_images=True, the prompt will include image marker preservation instructions
     translated_parts = await translate_chunks(
         structured_chunks,
         source_language,
@@ -807,13 +1527,16 @@ async def translate_text_as_string(
         llm_provider=llm_provider,
         gemini_api_key=gemini_api_key,
         openai_api_key=openai_api_key,
+        openrouter_api_key=openrouter_api_key,
         context_window=context_window,
         auto_adjust_context=auto_adjust_context,
         min_chunk_size=min_chunk_size,
         fast_mode=True,  # Fast mode uses pure text - no HTML/XML placeholders
         checkpoint_manager=checkpoint_manager,
         translation_id=translation_id,
-        resume_from_index=resume_from_index
+        resume_from_index=resume_from_index,
+        has_images=has_images,  # Pass image flag to include image marker preservation in prompt
+        prompt_options=prompt_options
     )
 
     if progress_callback:
