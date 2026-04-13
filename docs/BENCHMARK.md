@@ -6,7 +6,7 @@ This document describes the benchmark system for testing LLM translation quality
 
 The benchmark system allows you to:
 
-- **Test translation quality** of Ollama models across 40+ languages
+- **Test translation quality** of Ollama, OpenAI-compatible, or OpenRouter models across 40+ languages
 - **Evaluate translations** using OpenRouter LLMs (Claude, GPT-4, etc.)
 - **Generate detailed reports** with scores and rankings
 - **Publish results** to the GitHub wiki automatically
@@ -17,6 +17,9 @@ The benchmark system allows you to:
 # Run quick benchmark (19 representative languages)
 python -m benchmark.cli run --openrouter-key YOUR_OPENROUTER_KEY
 
+# Run quick benchmark against an OpenAI-compatible backend
+python -m benchmark.cli run --provider openai --openai-endpoint http://localhost:8080/v1 -m your-model
+
 # Run full benchmark (all 40+ languages)
 python -m benchmark.cli run --full --openrouter-key YOUR_OPENROUTER_KEY
 
@@ -26,7 +29,7 @@ python -m benchmark.cli wiki-publish
 
 ## Prerequisites
 
-1. **Ollama** running with at least one model installed
+1. **Translation backend**: Ollama, OpenAI-compatible endpoint, or OpenRouter
 2. **OpenRouter API key** for translation evaluation (get one at [openrouter.ai](https://openrouter.ai))
 
 ## CLI Commands
@@ -43,9 +46,12 @@ python -m benchmark.cli run [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `-m, --models MODEL [MODEL ...]` | Specific Ollama models to test. If omitted, auto-detects all available models |
+| `-m, --models MODEL [MODEL ...]` | Specific provider models to test. If omitted, auto-detects available models from the selected provider |
 | `-l, --languages CODE [CODE ...]` | Language codes to test (e.g., `fr de ja zh`). Default: quick test set (19 languages) |
 | `--full` | Run full benchmark with all 40+ languages |
+| `-p, --provider {ollama,openai,openrouter}` | Translation backend to benchmark |
+| `--openai-key KEY` | API key for OpenAI-compatible translation backends |
+| `--openai-endpoint URL` | OpenAI-compatible endpoint or `/v1` base URL |
 | `--openrouter-key KEY` | OpenRouter API key (can also use `OPENROUTER_API_KEY` env var) |
 | `--evaluator MODEL` | OpenRouter model for evaluation (default: `anthropic/claude-haiku-4.5`) |
 | `--ollama-endpoint URL` | Custom Ollama endpoint (default: from `.env` or `http://localhost:11434/api/generate`) |
@@ -56,6 +62,9 @@ python -m benchmark.cli run [OPTIONS]
 ```bash
 # Test specific models on specific languages
 python -m benchmark.cli run -m llama3:8b qwen2.5:14b mistral:7b -l fr de ja zh
+
+# Test an OpenAI-compatible server
+python -m benchmark.cli run -p openai --openai-endpoint http://localhost:8080/v1 -m qwen2.5-14b-instruct -l fr de ja zh
 
 # Use a different evaluator model
 python -m benchmark.cli run --evaluator anthropic/claude-3.5-sonnet --openrouter-key KEY

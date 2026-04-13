@@ -134,37 +134,31 @@ export const FileManager = {
         const modifiedDate = new Date(file.modified_date);
         const formattedDate = modifiedDate.toLocaleString();
 
-        // Determine file icon
-        const fileIcon = file.file_type === 'epub' ? '📚' :
-                        file.file_type === 'srt' ? '🎬' :
-                        file.file_type === 'txt' ? '📄' :
-                        file.file_type === 'opus' || file.file_type === 'mp3' ? '🎵' : '📎';
+        // Determine file icon (Material Symbols)
+        // Audio files that can be played (already audiobooks)
+        const isAudioFile = file.file_type === 'opus' || file.file_type === 'mp3';
+        const fileIconClass = file.file_type === 'epub' ? 'book' :
+                        file.file_type === 'srt' ? 'movie' :
+                        file.file_type === 'txt' ? 'description' :
+                        isAudioFile ? 'headphones' : 'attach_file';
 
         // Check if file supports TTS (text-based files only, not audio files)
         const supportsTTS = ['epub', 'txt', 'srt'].includes(file.file_type);
 
+        const tooltipInfo = `${file.file_type.toUpperCase()} • ${file.size_mb} MB • ${formattedDate}`;
+
         row.innerHTML = `
-            <td>
+            <td style="width: 36px; padding: 0.5rem;">
                 <input type="checkbox" class="file-checkbox" data-filename="${DomHelpers.escapeHtml(file.filename)}">
             </td>
-            <td>
-                <span class="clickable-filename" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="open" title="Click to open file">
-                    ${fileIcon} ${DomHelpers.escapeHtml(file.filename)}
+            <td style="max-width: 0;">
+                <span class="clickable-filename" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="open" title="${tooltipInfo}">
+                    <span class="material-symbols-outlined file-icon-cell">${fileIconClass}</span>
+                    <span class="filename-text">${DomHelpers.escapeHtml(file.filename)}</span>
                 </span>
             </td>
-            <td>${file.file_type.toUpperCase()}</td>
-            <td>${file.size_mb} MB</td>
-            <td>${formattedDate}</td>
-            <td style="text-align: center;">
-                ${supportsTTS ? `<button class="file-action-btn audiobook" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-filepath="${DomHelpers.escapeHtml(file.file_path)}" data-action="audiobook" title="Generate Audiobook (TTS)">
-                    🎧
-                </button>` : ''}
-                <button class="file-action-btn download" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="download" title="Download">
-                    📥
-                </button>
-                <button class="file-action-btn delete" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="delete" title="Delete">
-                    🗑️
-                </button>
+            <td style="width: 100px; text-align: center; white-space: nowrap; padding: 0.5rem;">
+                <div style="display: inline-flex; gap: 0.125rem; align-items: center; justify-content: center;">${supportsTTS ? `<button class="file-action-btn audiobook" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-filepath="${DomHelpers.escapeHtml(file.file_path)}" data-action="audiobook" title="Generate Audiobook (TTS)"><span class="material-symbols-outlined" style="font-size: 0.875rem;">headphones</span></button>` : ''}<button class="file-action-btn download" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="download" title="Download"><span class="material-symbols-outlined" style="font-size: 0.875rem;">download</span></button><button class="file-action-btn delete" data-filename="${DomHelpers.escapeHtml(file.filename)}" data-action="delete" title="Delete"><span class="material-symbols-outlined" style="font-size: 0.875rem;">delete</span></button></div>
             </td>
         `;
 
@@ -282,12 +276,14 @@ export const FileManager = {
         }
 
         // Update button text with count
+        const downloadBtn = DomHelpers.getElement('batchDownloadBtn');
+        const deleteBtn = DomHelpers.getElement('batchDeleteBtn');
         if (hasSelection) {
-            DomHelpers.setText('batchDownloadBtn', `📥 Download Selected (${selectedFiles.size})`);
-            DomHelpers.setText('batchDeleteBtn', `🗑️ Delete Selected (${selectedFiles.size})`);
+            if (downloadBtn) downloadBtn.innerHTML = `<span class="material-symbols-outlined">download</span> Download Selected (${selectedFiles.size})`;
+            if (deleteBtn) deleteBtn.innerHTML = `<span class="material-symbols-outlined">delete</span> Delete Selected (${selectedFiles.size})`;
         } else {
-            DomHelpers.setText('batchDownloadBtn', `📥 Download Selected`);
-            DomHelpers.setText('batchDeleteBtn', `🗑️ Delete Selected`);
+            if (downloadBtn) downloadBtn.innerHTML = `<span class="material-symbols-outlined">download</span> Download Selected`;
+            if (deleteBtn) deleteBtn.innerHTML = `<span class="material-symbols-outlined">delete</span> Delete Selected`;
         }
     },
 

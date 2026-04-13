@@ -10,13 +10,46 @@ import { ApiClient } from './api-client.js';
 import { DomHelpers } from '../ui/dom-helpers.js';
 import { MessageLogger } from '../ui/message-logger.js';
 
-const STORAGE_KEY = 'tbl_user_preferences';
+// Storage configuration with versioning
+const STORAGE_VERSION = 1;
+const STORAGE_KEY_PREFIX = 'tbl_user_preferences';
+const STORAGE_KEY = `${STORAGE_KEY_PREFIX}_v${STORAGE_VERSION}`;
+
+/**
+ * Validate user preferences structure
+ * @param {any} data - Data to validate
+ * @returns {boolean} True if valid
+ */
+function validatePreferences(data) {
+    if (!data || typeof data !== 'object') return false;
+
+    // Check version
+    if (!('version' in data)) return false;
+
+    // Validate types for known fields (non-exhaustive, just critical ones)
+    if ('ttsEnabled' in data && typeof data.ttsEnabled !== 'boolean') return false;
+    if ('textCleanup' in data && typeof data.textCleanup !== 'boolean') return false;
+    if ('refineTranslation' in data && typeof data.refineTranslation !== 'boolean') return false;
+
+    return true;
+}
 
 /**
  * Flag to prevent localStorage from overriding .env default model
  * Set to true once the .env model has been applied
  */
 let envModelApplied = false;
+
+/**
+ * Debounce timer for auto-save
+ */
+let autoSaveTimer = null;
+const AUTO_SAVE_DELAY = 1000; // 1 second debounce
+
+/**
+ * Flag to prevent auto-save during initial load
+ */
+let isInitializing = true;
 
 /**
  * Settings that are saved to localStorage (non-sensitive)
@@ -28,8 +61,14 @@ const LOCAL_SETTINGS = [
     'lastTargetLanguage',
     'lastApiEndpoint',
     'lastOpenaiEndpoint',
-    'fastMode',
-    'ttsEnabled'
+    'outputFilenamePattern',
+    'ttsEnabled',
+    'textCleanup',
+    'refineTranslation',
+    'bilingualMode',
+    'customInstructionFile',
+    'apiEndpointCustomized',  // Track if user manually changed endpoint
+    'openaiEndpointCustomized'
 ];
 
 /**
@@ -38,15 +77,143 @@ const LOCAL_SETTINGS = [
 const ENV_SETTINGS_MAP = {
     'geminiApiKey': 'GEMINI_API_KEY',
     'openaiApiKey': 'OPENAI_API_KEY',
-    'openrouterApiKey': 'OPENROUTER_API_KEY'
+    'openrouterApiKey': 'OPENROUTER_API_KEY',
+    'mistralApiKey': 'MISTRAL_API_KEY',
+    'deepseekApiKey': 'DEEPSEEK_API_KEY',
+    'poeApiKey': 'POE_API_KEY',
+    'nimApiKey': 'NIM_API_KEY'
 };
 
 export const SettingsManager = {
     /**
-     * Initialize settings manager - load saved preferences
+     * Initialize settings manager - load saved preferences and setup auto-save
      */
     initialize() {
+        // Clean up old storage versions
+        this.cleanupOldStorageVersions();
+
         this.loadLocalPreferences();
+
+        // Listen for custom instructions loaded event
+        window.addEventListener('customInstructionsLoaded', () => {
+            this.applyPendingCustomInstructionSelection();
+        });
+
+        // Setup auto-save listeners after a short delay to avoid triggering during initial load
+        setTimeout(() => {
+            this._setupAutoSaveListeners();
+            isInitializing = false;
+        }, 500);
+    },
+
+    /**
+     * Clean up old localStorage versions
+     */
+    cleanupOldStorageVersions() {
+        try {
+            // Remove old non-versioned key
+            const oldKey = 'tbl_user_preferences';
+            if (localStorage.getItem(oldKey)) {
+                // Migrate data from old key before removing
+                const oldData = localStorage.getItem(oldKey);
+                if (oldData) {
+                    try {
+                        const parsed = JSON.parse(oldData);
+                        // Add version and save to new key
+                        parsed.version = STORAGE_VERSION;
+                        localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+                    } catch (e) {
+                        console.warn('Could not migrate old preferences:', e);
+                    }
+                }
+                localStorage.removeItem(oldKey);
+            }
+
+            // Remove any other versions (future-proofing)
+            for (let i = 0; i < STORAGE_VERSION; i++) {
+                const oldVersionKey = `${STORAGE_KEY_PREFIX}_v${i}`;
+                if (localStorage.getItem(oldVersionKey)) {
+                    localStorage.removeItem(oldVersionKey);
+                }
+            }
+        } catch (error) {
+            console.warn('Failed to cleanup old storage versions:', error);
+        }
+    },
+
+    /**
+     * Setup event listeners for auto-save on all settings elements
+     * @private
+     */
+    _setupAutoSaveListeners() {
+        // Elements that trigger auto-save
+        const autoSaveElements = [
+            // Provider and model
+            { id: 'llmProvider', event: 'change' },
+            { id: 'model', event: 'change' },
+            // API endpoints
+            { id: 'apiEndpoint', event: 'change' },
+            { id: 'openaiEndpoint', event: 'change' },
+            // Output filename pattern
+            { id: 'outputFilenamePattern', event: 'change' },
+            // API keys (save to .env)
+            { id: 'geminiApiKey', event: 'change' },
+            { id: 'openaiApiKey', event: 'change' },
+            { id: 'openrouterApiKey', event: 'change' },
+            { id: 'mistralApiKey', event: 'change' },
+            { id: 'deepseekApiKey', event: 'change' },
+            { id: 'poeApiKey', event: 'change' },
+            { id: 'nimApiKey', event: 'change' },
+            // Languages
+            { id: 'sourceLang', event: 'change' },
+            { id: 'targetLang', event: 'change' },
+            { id: 'customSourceLang', event: 'change' },
+            { id: 'customTargetLang', event: 'change' },
+            // Checkboxes
+            { id: 'ttsEnabled', event: 'change' },
+            { id: 'textCleanup', event: 'change' },
+            { id: 'refineTranslation', event: 'change' },
+            { id: 'bilingualMode', event: 'change' },
+            { id: 'customInstructionSelect', event: 'change' }
+        ];
+
+        autoSaveElements.forEach(({ id, event }) => {
+            const element = DomHelpers.getElement(id);
+            if (element) {
+                element.addEventListener(event, () => this._triggerAutoSave());
+            }
+        });
+
+    },
+
+    /**
+     * Trigger auto-save with debounce
+     * @private
+     */
+    _triggerAutoSave() {
+        if (isInitializing) return;
+
+        // Clear existing timer
+        if (autoSaveTimer) {
+            clearTimeout(autoSaveTimer);
+        }
+
+        // Set new timer
+        autoSaveTimer = setTimeout(async () => {
+            await this._performAutoSave();
+        }, AUTO_SAVE_DELAY);
+    },
+
+    /**
+     * Perform the actual auto-save
+     * @private
+     */
+    async _performAutoSave() {
+        try {
+            await this.saveAllSettings(true);
+        } catch {
+            // Auto-save failed silently
+        }
     },
 
     /**
@@ -56,9 +223,30 @@ export const SettingsManager = {
     getLocalPreferences() {
         try {
             const stored = localStorage.getItem(STORAGE_KEY);
-            return stored ? JSON.parse(stored) : {};
-        } catch (e) {
-            console.error('Error reading preferences:', e);
+
+            if (!stored) return {};
+
+            const parsed = JSON.parse(stored);
+
+            // Validate structure
+            if (!validatePreferences(parsed)) {
+                console.warn('Invalid preferences structure, resetting to defaults');
+                localStorage.removeItem(STORAGE_KEY);
+                return {};
+            }
+
+            // Check version compatibility
+            if (parsed.version !== STORAGE_VERSION) {
+                console.warn(`Preferences version mismatch (found ${parsed.version}, expected ${STORAGE_VERSION})`);
+                // Could implement migration here in the future
+                localStorage.removeItem(STORAGE_KEY);
+                return {};
+            }
+
+            return parsed;
+        } catch (error) {
+            console.error('Failed to load preferences from localStorage:', error);
+            MessageLogger.addLog('⚠️ Could not load saved preferences');
             return {};
         }
     },
@@ -70,10 +258,23 @@ export const SettingsManager = {
     saveLocalPreferences(prefs) {
         try {
             const current = this.getLocalPreferences();
-            const updated = { ...current, ...prefs };
+            const updated = {
+                ...current,
+                ...prefs,
+                version: STORAGE_VERSION,
+                timestamp: Date.now()
+            };
+
             localStorage.setItem(STORAGE_KEY, JSON.stringify(updated));
-        } catch (e) {
-            console.error('Error saving preferences:', e);
+        } catch (error) {
+            console.error('Failed to save preferences to localStorage:', error);
+
+            // Check if it's a quota exceeded error
+            if (error.name === 'QuotaExceededError') {
+                MessageLogger.addLog('⚠️ Browser storage full, could not save preferences');
+            } else {
+                MessageLogger.addLog('⚠️ Failed to save preferences');
+            }
         }
     },
 
@@ -105,27 +306,22 @@ export const SettingsManager = {
             DomHelpers.setValue('openaiEndpoint', prefs.lastOpenaiEndpoint);
         }
 
+        // Apply output filename pattern (naming convention)
+        if (prefs.outputFilenamePattern) {
+            DomHelpers.setValue('outputFilenamePattern', prefs.outputFilenamePattern);
+        }
+
         // Apply last provider AFTER endpoints are set
-        // This triggers model loading with the correct endpoint
+        // NOTE: We set the provider value but DON'T trigger the change event here.
+        // The change event would trigger model loading, but we need to wait for
+        // FormManager.loadDefaultConfig() to complete and update the endpoint
+        // from the server configuration first (fixes GitHub issue #108 part 2).
         if (prefs.lastProvider) {
             const providerSelect = DomHelpers.getElement('llmProvider');
             if (providerSelect) {
                 providerSelect.value = prefs.lastProvider;
-                // Trigger change event to show correct settings panel and load models
-                providerSelect.dispatchEvent(new Event('change'));
-            }
-        }
-
-        // Apply Fast Mode setting
-        if (prefs.fastMode !== undefined) {
-            const fastModeCheckbox = DomHelpers.getElement('fastMode');
-            if (fastModeCheckbox) {
-                fastModeCheckbox.checked = prefs.fastMode;
-                // Show/hide the info panel based on checkbox state
-                const fastModeInfo = DomHelpers.getElement('fastModeInfo');
-                if (fastModeInfo) {
-                    fastModeInfo.style.display = prefs.fastMode ? 'block' : 'none';
-                }
+                // Don't trigger change event - ProviderManager will handle model loading
+                // after the 'defaultConfigLoaded' event is dispatched
             }
         }
 
@@ -139,6 +335,44 @@ export const SettingsManager = {
                 if (ttsOptions) {
                     ttsOptions.style.display = prefs.ttsEnabled ? 'block' : 'none';
                 }
+            }
+        }
+
+        // Apply Prompt Options settings
+        if (prefs.textCleanup !== undefined) {
+            const cleanupCheckbox = DomHelpers.getElement('textCleanup');
+            if (cleanupCheckbox) {
+                cleanupCheckbox.checked = prefs.textCleanup;
+            }
+        }
+        if (prefs.refineTranslation !== undefined) {
+            const refineCheckbox = DomHelpers.getElement('refineTranslation');
+            if (refineCheckbox) {
+                refineCheckbox.checked = prefs.refineTranslation;
+            }
+        }
+        if (prefs.bilingualMode !== undefined) {
+            const bilingualCheckbox = DomHelpers.getElement('bilingualMode');
+            if (bilingualCheckbox) {
+                bilingualCheckbox.checked = prefs.bilingualMode;
+            }
+        }
+
+        // Store custom instruction file for later application (after loadCustomInstructions completes)
+        if (prefs.customInstructionFile) {
+            window.__pendingCustomInstructionSelection = prefs.customInstructionFile;
+        }
+
+        // Keep Prompt Options section open if any option is active
+        const hasAnyPromptOption = prefs.textCleanup || prefs.refineTranslation || prefs.bilingualMode || prefs.customInstructionFile;
+        if (hasAnyPromptOption) {
+            const promptOptionsSection = DomHelpers.getElement('promptOptionsSection');
+            const promptOptionsIcon = DomHelpers.getElement('promptOptionsIcon');
+            if (promptOptionsSection) {
+                promptOptionsSection.classList.remove('hidden');
+            }
+            if (promptOptionsIcon) {
+                promptOptionsIcon.style.transform = 'rotate(180deg)';
             }
         }
     },
@@ -181,9 +415,10 @@ export const SettingsManager = {
      * Save current form state to local preferences
      */
     saveCurrentState() {
-        // Get checkbox values
-        const fastModeCheckbox = DomHelpers.getElement('fastMode');
         const ttsEnabledCheckbox = DomHelpers.getElement('ttsEnabled');
+        const textCleanupCheckbox = DomHelpers.getElement('textCleanup');
+        const refineTranslationCheckbox = DomHelpers.getElement('refineTranslation');
+        const bilingualModeCheckbox = DomHelpers.getElement('bilingualMode');
 
         const prefs = {
             lastProvider: DomHelpers.getValue('llmProvider'),
@@ -192,8 +427,12 @@ export const SettingsManager = {
             lastTargetLanguage: this._getLanguageValue('targetLang', 'customTargetLang'),
             lastApiEndpoint: DomHelpers.getValue('apiEndpoint'),
             lastOpenaiEndpoint: DomHelpers.getValue('openaiEndpoint'),
-            fastMode: fastModeCheckbox ? fastModeCheckbox.checked : false,
-            ttsEnabled: ttsEnabledCheckbox ? ttsEnabledCheckbox.checked : false
+            outputFilenamePattern: DomHelpers.getValue('outputFilenamePattern'),
+            ttsEnabled: ttsEnabledCheckbox ? ttsEnabledCheckbox.checked : false,
+            textCleanup: textCleanupCheckbox ? textCleanupCheckbox.checked : false,
+            refineTranslation: refineTranslationCheckbox ? refineTranslationCheckbox.checked : false,
+            bilingualMode: bilingualModeCheckbox ? bilingualModeCheckbox.checked : false,
+            customInstructionFile: DomHelpers.getValue('customInstructionSelect') || ''
         };
 
         this.saveLocalPreferences(prefs);
@@ -221,7 +460,11 @@ export const SettingsManager = {
         const keyMap = {
             'gemini': 'GEMINI_API_KEY',
             'openai': 'OPENAI_API_KEY',
-            'openrouter': 'OPENROUTER_API_KEY'
+            'openrouter': 'OPENROUTER_API_KEY',
+            'mistral': 'MISTRAL_API_KEY',
+            'deepseek': 'DEEPSEEK_API_KEY',
+            'poe': 'POE_API_KEY',
+            'nim': 'NIM_API_KEY'
         };
 
         const envKey = keyMap[provider];
@@ -237,9 +480,7 @@ export const SettingsManager = {
                 return true;
             }
             return false;
-        } catch (e) {
-            console.error('Error saving API key:', e);
-            MessageLogger.addLog(`Failed to save API key: ${e.message}`, 'error');
+        } catch {
             return false;
         }
     },
@@ -267,6 +508,34 @@ export const SettingsManager = {
             } else if (provider === 'openrouter') {
                 const key = DomHelpers.getValue('openrouterApiKey');
                 if (key) envSettings['OPENROUTER_API_KEY'] = key;
+            } else if (provider === 'mistral') {
+                const key = DomHelpers.getValue('mistralApiKey');
+                if (key) envSettings['MISTRAL_API_KEY'] = key;
+            } else if (provider === 'deepseek') {
+                const key = DomHelpers.getValue('deepseekApiKey');
+                if (key) envSettings['DEEPSEEK_API_KEY'] = key;
+            } else if (provider === 'poe') {
+                const key = DomHelpers.getValue('poeApiKey');
+                if (key) envSettings['POE_API_KEY'] = key;
+            } else if (provider === 'nim') {
+                const key = DomHelpers.getValue('nimApiKey');
+                if (key) envSettings['NIM_API_KEY'] = key;
+            }
+
+            // Save endpoints to .env
+            const ollamaEndpoint = DomHelpers.getValue('apiEndpoint');
+            const openaiEndpoint = DomHelpers.getValue('openaiEndpoint');
+            if (ollamaEndpoint) {
+                envSettings['OLLAMA_API_ENDPOINT'] = ollamaEndpoint;
+            }
+            if (openaiEndpoint) {
+                envSettings['OPENAI_API_ENDPOINT'] = openaiEndpoint;
+            }
+
+            // Save output filename pattern (naming convention)
+            const filenamePattern = DomHelpers.getValue('outputFilenamePattern');
+            if (filenamePattern) {
+                envSettings['OUTPUT_FILENAME_PATTERN'] = filenamePattern;
             }
 
             // Also save provider and model as defaults
@@ -278,17 +547,23 @@ export const SettingsManager = {
                     envSettings['OPENROUTER_MODEL'] = model;
                 } else if (provider === 'gemini') {
                     envSettings['GEMINI_MODEL'] = model;
+                } else if (provider === 'mistral') {
+                    envSettings['MISTRAL_MODEL'] = model;
+                } else if (provider === 'deepseek') {
+                    envSettings['DEEPSEEK_MODEL'] = model;
+                } else if (provider === 'poe') {
+                    envSettings['POE_MODEL'] = model;
+                } else if (provider === 'nim') {
+                    envSettings['NIM_MODEL'] = model;
                 } else {
                     // Ollama and OpenAI use DEFAULT_MODEL
                     envSettings['DEFAULT_MODEL'] = model;
                 }
             }
 
-            // Save languages
-            const srcLang = this._getLanguageValue('sourceLang', 'customSourceLang');
-            const tgtLang = this._getLanguageValue('targetLang', 'customTargetLang');
-            if (srcLang) envSettings['DEFAULT_SOURCE_LANGUAGE'] = srcLang;
-            if (tgtLang) envSettings['DEFAULT_TARGET_LANGUAGE'] = tgtLang;
+            // Languages are no longer saved to .env - they are:
+            // - Source: auto-detected from file content
+            // - Target: auto-detected from browser language per session
 
             if (Object.keys(envSettings).length > 0) {
                 try {
@@ -297,7 +572,6 @@ export const SettingsManager = {
                     this.resetEnvModelApplied();
                     return { success: true, savedToEnv: result.saved_keys };
                 } catch (e) {
-                    console.error('Error saving to .env:', e);
                     return { success: false, error: e.message };
                 }
             }
@@ -313,7 +587,6 @@ export const SettingsManager = {
     applyPendingModelSelection() {
         // Don't apply localStorage preference if .env model was already applied
         if (envModelApplied) {
-            console.log('⏭️ Skipping localStorage model - .env model already applied');
             delete window.__pendingModelSelection;
             return;
         }
@@ -327,7 +600,6 @@ export const SettingsManager = {
                     if (option.value === window.__pendingModelSelection) {
                         modelSelect.value = window.__pendingModelSelection;
                         found = true;
-                        console.log(`✅ Applied saved model preference: ${window.__pendingModelSelection}`);
                         break;
                     }
                 }
@@ -339,12 +611,37 @@ export const SettingsManager = {
     },
 
     /**
+     * Apply pending custom instruction selection after custom instructions are loaded
+     * Called when 'customInstructionsLoaded' event is fired
+     */
+    applyPendingCustomInstructionSelection() {
+        if (window.__pendingCustomInstructionSelection) {
+            const select = DomHelpers.getElement('customInstructionSelect');
+            if (select && select.options.length > 0) {
+                // Check if the value exists in options
+                let found = false;
+                for (let option of select.options) {
+                    if (option.value === window.__pendingCustomInstructionSelection) {
+                        select.value = window.__pendingCustomInstructionSelection;
+                        found = true;
+                        console.log('[SettingsManager] Restored custom instruction:', window.__pendingCustomInstructionSelection);
+                        break;
+                    }
+                }
+                if (!found) {
+                    console.warn('[SettingsManager] Custom instruction not found:', window.__pendingCustomInstructionSelection);
+                }
+                delete window.__pendingCustomInstructionSelection;
+            }
+        }
+    },
+
+    /**
      * Mark that the .env default model has been applied
      * This prevents localStorage from overriding it
      */
     markEnvModelApplied() {
         envModelApplied = true;
-        console.log('🔒 .env default model locked in');
     },
 
     /**
@@ -353,7 +650,6 @@ export const SettingsManager = {
      */
     resetEnvModelApplied() {
         envModelApplied = false;
-        console.log('🔓 .env model lock reset - user saved new settings');
     },
 
     /**
@@ -362,6 +658,104 @@ export const SettingsManager = {
      */
     isEnvModelApplied() {
         return envModelApplied;
+    },
+
+    /**
+     * Mark an endpoint as customized by the user
+     * @param {string} endpointType - 'ollama' or 'openai'
+     */
+    markEndpointCustomized(endpointType) {
+        const key = endpointType === 'openai' ? 'openaiEndpointCustomized' : 'apiEndpointCustomized';
+        this.saveLocalPreferences({ [key]: true });
+        this.updateEndpointBadge(endpointType, true);
+    },
+
+    /**
+     * Check if an endpoint was customized by the user
+     * @param {string} endpointType - 'ollama' or 'openai'
+     * @returns {boolean}
+     */
+    isEndpointCustomized(endpointType) {
+        const prefs = this.getLocalPreferences();
+        return endpointType === 'openai' 
+            ? prefs.openaiEndpointCustomized 
+            : prefs.apiEndpointCustomized;
+    },
+
+    /**
+     * Reset endpoint to server default (.env value)
+     * @param {string} endpointType - 'ollama' or 'openai'
+     * @param {string} serverValue - The value from server config
+     */
+    resetEndpointToServerDefault(endpointType, serverValue) {
+        const inputId = endpointType === 'openai' ? 'openaiEndpoint' : 'apiEndpoint';
+        const key = endpointType === 'openai' ? 'openaiEndpointCustomized' : 'apiEndpointCustomized';
+        const storageKey = endpointType === 'openai' ? 'lastOpenaiEndpoint' : 'lastApiEndpoint';
+        
+        // Update input field
+        DomHelpers.setValue(inputId, serverValue);
+        
+        // Clear customized flag
+        const prefs = this.getLocalPreferences();
+        delete prefs[key];
+        delete prefs[storageKey];
+        this.saveLocalPreferences(prefs);
+        
+        // Update badge
+        this.updateEndpointBadge(endpointType, false);
+        
+        // Reload models with new endpoint
+        const currentProvider = DomHelpers.getValue('llmProvider');
+        if (currentProvider === endpointType || (endpointType === 'ollama' && currentProvider === 'ollama')) {
+            window.dispatchEvent(new Event('endpointReset'));
+        }
+        
+        MessageLogger.addLog(`↺ Endpoint reset to server default`);
+    },
+
+    /**
+     * Update the visual badge for endpoint customization
+     * @param {string} endpointType - 'ollama' or 'openai'
+     * @param {boolean} isCustomized - Whether the endpoint is customized
+     */
+    updateEndpointBadge(endpointType, isCustomized) {
+        const badgeId = endpointType === 'openai' ? 'openaiEndpointBadge' : 'apiEndpointBadge';
+        const badge = DomHelpers.getElement(badgeId);
+        if (badge) {
+            badge.style.display = isCustomized ? 'inline-block' : 'none';
+        }
+        
+        // Also show/hide the reset button
+        const resetBtnId = endpointType === 'openai' ? 'resetOpenaiEndpointBtn' : 'resetApiEndpointBtn';
+        const resetBtn = DomHelpers.getElement(resetBtnId);
+        if (resetBtn) {
+            resetBtn.style.display = isCustomized ? 'inline-flex' : 'none';
+        }
+    },
+
+    /**
+     * Initialize endpoint badges on page load
+     * Call this after server config is loaded
+     * @param {Object} serverConfig - The config from /api/config
+     */
+    initializeEndpointBadges(serverConfig) {
+        const prefs = this.getLocalPreferences();
+        
+        // Check Ollama endpoint
+        if (prefs.apiEndpointCustomized && prefs.lastApiEndpoint) {
+            const serverEndpoint = serverConfig.ollama_api_endpoint || serverConfig.api_endpoint;
+            if (prefs.lastApiEndpoint !== serverEndpoint) {
+                this.updateEndpointBadge('ollama', true);
+            }
+        }
+        
+        // Check OpenAI endpoint
+        if (prefs.openaiEndpointCustomized && prefs.lastOpenaiEndpoint) {
+            const serverEndpoint = serverConfig.openai_api_endpoint;
+            if (prefs.lastOpenaiEndpoint !== serverEndpoint) {
+                this.updateEndpointBadge('openai', true);
+            }
+        }
     }
 };
 

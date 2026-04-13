@@ -45,6 +45,8 @@ import { ResumeManager } from './translation/resume-manager.js';
 // ========================================
 import { Validators } from './utils/validators.js';
 import { LifecycleManager } from './utils/lifecycle-manager.js';
+import { StatusManager } from './utils/status-manager.js';
+import { initializeThemeManager } from './utils/theme-manager.js';
 
 // ========================================
 // TTS Modules
@@ -120,11 +122,91 @@ function handleTtsUpdate(data) {
                 ttsProgressBar.textContent = 'Failed';
                 ttsProgressBar.style.background = '#ef4444';
             }
+
+            const errorText = error || message || 'Unknown error';
+            const isFFmpegError = errorText.toLowerCase().includes('ffmpeg');
+
             if (ttsStatusText) {
-                ttsStatusText.textContent = `❌ TTS failed: ${error || message || 'Unknown error'}`;
+                if (isFFmpegError) {
+                    // Show FFmpeg install button instead of long instructions
+                    ttsStatusText.innerHTML = `
+                        <span style="color: #ef4444;">❌ FFmpeg is required for audio encoding</span>
+                        <div style="margin-top: 10px;">
+                            <button id="installFFmpegBtn" class="btn btn-primary" style="margin-right: 10px;" onclick="window.installFFmpeg()">
+                                <span class="material-symbols-outlined" style="font-size: 18px; vertical-align: middle;">download</span>
+                                Install FFmpeg (winget)
+                            </button>
+                            <a href="https://ffmpeg.org/download.html" target="_blank" class="btn btn-secondary" style="text-decoration: none;">
+                                Manual Download
+                            </a>
+                        </div>
+                        <p style="margin-top: 8px; font-size: 0.8rem; color: var(--text-secondary);">
+                            After installation, restart the application.
+                        </p>
+                    `;
+                } else {
+                    ttsStatusText.textContent = `❌ TTS failed: ${errorText}`;
+                }
             }
-            MessageLogger.addLog(`❌ TTS failed: ${error || message || 'Unknown error'}`);
+            MessageLogger.addLog(`❌ TTS failed: ${errorText}`);
             break;
+    }
+}
+
+/**
+ * Install FFmpeg via winget (Windows)
+ */
+window.installFFmpeg = async function() {
+    const btn = document.getElementById('installFFmpegBtn');
+    const ttsStatusText = DomHelpers.getElement('ttsStatusText');
+
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `
+            <span class="material-symbols-outlined rotating" style="font-size: 18px; vertical-align: middle;">sync</span>
+            Installing...
+        `;
+    }
+
+    try {
+        const response = await fetch('/api/tts/ffmpeg/install', { method: 'POST' });
+        const result = await response.json();
+
+        if (result.success) {
+            if (ttsStatusText) {
+                ttsStatusText.innerHTML = `
+                    <span style="color: #22c55e;">✅ ${result.message}</span>
+                    <p style="margin-top: 8px; font-size: 0.8rem; color: var(--text-secondary);">
+                        Please restart the application to use TTS.
+                    </p>
+                `;
+            }
+            MessageLogger.addLog('✅ FFmpeg installed successfully');
+        } else {
+            if (ttsStatusText) {
+                ttsStatusText.innerHTML = `
+                    <span style="color: #ef4444;">❌ Installation failed: ${result.error}</span>
+                    <div style="margin-top: 10px;">
+                        <a href="https://ffmpeg.org/download.html" target="_blank" class="btn btn-secondary" style="text-decoration: none;">
+                            Manual Download
+                        </a>
+                    </div>
+                `;
+            }
+            MessageLogger.addLog(`❌ FFmpeg installation failed: ${result.error}`);
+        }
+    } catch (err) {
+        if (ttsStatusText) {
+            ttsStatusText.innerHTML = `
+                <span style="color: #ef4444;">❌ Installation error: ${err.message}</span>
+                <div style="margin-top: 10px;">
+                    <a href="https://ffmpeg.org/download.html" target="_blank" class="btn btn-secondary" style="text-decoration: none;">
+                        Manual Download
+                    </a>
+                </div>
+            `;
+        }
+        MessageLogger.addLog(`❌ FFmpeg installation error: ${err.message}`);
     }
 }
 
@@ -134,18 +216,23 @@ function handleTtsUpdate(data) {
 
 /**
  * Initialize application state
+ * Note: Some state (like files.toProcess) will be restored from localStorage
+ * by their respective modules, so we only set defaults if not already present
  */
 function initializeState() {
-    // Files state
-    StateManager.setState('files.toProcess', []);
-    StateManager.setState('files.selected', []);
-    StateManager.setState('files.managed', []);
+    // Files state - only initialize if not already set (will be restored by FileUpload)
+    if (!StateManager.getState('files.toProcess')) {
+        StateManager.setState('files.toProcess', []);
+    }
+    if (!StateManager.getState('files.selected')) {
+        StateManager.setState('files.selected', []);
+    }
+    if (!StateManager.getState('files.managed')) {
+        StateManager.setState('files.managed', []);
+    }
 
-    // Translation state
-    StateManager.setState('translation.currentJob', null);
-    StateManager.setState('translation.isBatchActive', false);
-    StateManager.setState('translation.activeJobs', []);
-    StateManager.setState('translation.hasActive', false);
+    // Translation state - DO NOT reset here, will be restored by TranslationTracker from localStorage
+    // TranslationTracker.initialize() will handle loading saved state or initializing defaults
 
     // UI state
     StateManager.setState('ui.currentProvider', 'ollama');
@@ -155,6 +242,34 @@ function initializeState() {
     // Models state
     StateManager.setState('models.currentLoadRequest', null);
     StateManager.setState('models.availableModels', []);
+}
+
+/**
+ * Calculate and apply preview height based on MAX_TOKENS_PER_CHUNK
+ * @param {number} maxTokens - MAX_TOKENS_PER_CHUNK value
+ */
+function updatePreviewHeight(maxTokens = 450) {
+    const fixedHeight = 300;
+    document.documentElement.style.setProperty('--preview-height', `${fixedHeight}px`);
+}
+
+/**
+ * Fetch and apply MAX_TOKENS_PER_CHUNK from server
+ */
+async function initializePreviewHeight() {
+    try {
+        // Fetch config from server
+        const response = await fetch('/api/config/max-tokens');
+        if (response.ok) {
+            const data = await response.json();
+            const maxTokens = data.max_tokens_per_chunk || 450;
+            updatePreviewHeight(maxTokens);
+        } else {
+            updatePreviewHeight(450);
+        }
+    } catch {
+        updatePreviewHeight(450);
+    }
 }
 
 // ========================================
@@ -245,7 +360,8 @@ function wireModuleEvents() {
     StateManager.subscribe('files.toProcess', (files) => {
         const translateBtn = DomHelpers.getElement('translateBtn');
         if (translateBtn && !StateManager.getState('translation.isBatchActive')) {
-            translateBtn.disabled = files.length === 0;
+            // Only enable if files exist AND LLM is connected
+            translateBtn.disabled = files.length === 0 || !StatusManager.isConnected();
         }
     });
 }
@@ -257,16 +373,18 @@ function wireModuleEvents() {
 /**
  * Initialize all modules in proper order
  */
-function initializeModules() {
-    console.log('🚀 Initializing TranslateBookWithLLM application...');
+async function initializeModules() {
 
     // 1. Core infrastructure
     initializeState();
     WebSocketManager.connect();
-    SettingsManager.initialize();
 
     // 2. UI modules
+    initializeThemeManager();
+    SettingsManager.initialize();
     FormManager.initialize();
+    StatusManager.initialize();
+    initializePreviewHeight(); // Load and apply preview height
 
     // 3. Provider modules
     ProviderManager.initialize();
@@ -277,7 +395,9 @@ function initializeModules() {
     FileManager.initialize();
 
     // 5. Translation modules
-    TranslationTracker.initialize();
+    // IMPORTANT: await TranslationTracker.initialize() because it's now async
+    // It needs to check server session before restoring state
+    await TranslationTracker.initialize();
     ProgressManager.reset();
     ResumeManager.initialize();
 
@@ -289,13 +409,6 @@ function initializeModules() {
 
     // 8. Wire up events
     wireModuleEvents();
-
-    console.log('✅ Application initialized successfully');
-
-    // Expose StateManager for debugging
-    if (typeof window !== 'undefined') {
-        window.__STATE_MANAGER__ = StateManager;
-    }
 }
 
 // ========================================
@@ -320,8 +433,9 @@ window.resetFiles = () => {
 };
 
 // Form Manager
-window.toggleAdvanced = FormManager.toggleAdvanced.bind(FormManager);
+window.toggleSettingsOptions = FormManager.toggleSettingsOptions.bind(FormManager);
 window.togglePromptOptions = FormManager.togglePromptOptions.bind(FormManager);
+window.toggleActivityLog = FormManager.toggleActivityLog.bind(FormManager);
 window.checkCustomSourceLanguage = (element) => FormManager.checkCustomSourceLanguage(element);
 window.checkCustomTargetLanguage = (element) => FormManager.checkCustomTargetLanguage(element);
 window.resetForm = FormManager.resetForm.bind(FormManager);
@@ -364,38 +478,16 @@ window.refreshModels = ProviderManager.refreshModels.bind(ProviderManager);
 
 // Settings Manager
 window.saveSettings = async () => {
-    const saveBtn = DomHelpers.getElement('saveSettingsBtn');
-    const statusSpan = DomHelpers.getElement('saveSettingsStatus');
-
-    if (saveBtn) {
-        saveBtn.disabled = true;
-        DomHelpers.setText(saveBtn, '💾 Saving...');
+    const result = await SettingsManager.saveAllSettings(true);
+    if (result.success && result.savedToEnv && result.savedToEnv.length > 0) {
+        MessageLogger.showMessage(`✅ Settings saved: ${result.savedToEnv.join(', ')}`, 'success');
+        MessageLogger.addLog(`💾 Saved to .env: ${result.savedToEnv.join(', ')}`);
+    } else if (result.success) {
+        MessageLogger.showMessage('✅ Preferences saved', 'success');
+    } else {
+        MessageLogger.showMessage(`❌ Failed to save: ${result.error}`, 'error');
     }
-
-    try {
-        const result = await SettingsManager.saveAllSettings(true);
-        if (result.success) {
-            if (statusSpan) {
-                statusSpan.textContent = '✅ Settings saved!';
-                statusSpan.style.color = '#059669';
-                setTimeout(() => { statusSpan.textContent = ''; }, 3000);
-            }
-            MessageLogger.addLog(`Settings saved: ${result.savedToEnv?.join(', ') || 'local preferences'}`);
-        } else {
-            throw new Error(result.error || 'Unknown error');
-        }
-    } catch (error) {
-        if (statusSpan) {
-            statusSpan.textContent = `❌ ${error.message}`;
-            statusSpan.style.color = '#dc2626';
-        }
-        MessageLogger.addLog(`Failed to save settings: ${error.message}`, 'error');
-    } finally {
-        if (saveBtn) {
-            saveBtn.disabled = false;
-            DomHelpers.setText(saveBtn, '💾 Save Settings');
-        }
-    }
+    return result;
 };
 
 // Message Logger
@@ -452,8 +544,7 @@ async function showTTSModal(filename, filepath) {
         ]);
         providersInfo = providersInfo.providers || {};
         voicePrompts = voicePrompts.voice_prompts || [];
-    } catch (e) {
-        console.error('Failed to load TTS info:', e);
+    } catch {
     }
 
     const isChatterboxAvailable = providersInfo.chatterbox?.available || false;
@@ -504,16 +595,52 @@ async function showTTSModal(filename, filepath) {
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 13px;">Target Language</label>
                                 <select id="ttsModalLanguage" class="form-control" style="font-size: 13px;">
-                                    <option value="Chinese">Chinese</option>
+                                    <!-- Most Common -->
+                                    <option value="Chinese">Chinese (中文)</option>
                                     <option value="English">English</option>
-                                    <option value="French">French</option>
-                                    <option value="Spanish">Spanish</option>
-                                    <option value="German">German</option>
-                                    <option value="Italian">Italian</option>
-                                    <option value="Japanese">Japanese</option>
-                                    <option value="Korean">Korean</option>
-                                    <option value="Portuguese">Portuguese</option>
-                                    <option value="Russian">Russian</option>
+                                    <option value="French">French (Français)</option>
+                                    <option value="Spanish">Spanish (Español)</option>
+                                    <option value="German">German (Deutsch)</option>
+                                    <option value="Japanese">Japanese (日本語)</option>
+                                    <option value="Korean">Korean (한국어)</option>
+                                    <option value="Portuguese">Portuguese (Português)</option>
+                                    <option value="Russian">Russian (Русский)</option>
+                                    <option value="Arabic">Arabic (العربية)</option>
+                                    <!-- European -->
+                                    <option value="Italian">Italian (Italiano)</option>
+                                    <option value="Dutch">Dutch (Nederlands)</option>
+                                    <option value="Polish">Polish (Polski)</option>
+                                    <option value="Swedish">Swedish (Svenska)</option>
+                                    <option value="Norwegian">Norwegian (Norsk)</option>
+                                    <option value="Danish">Danish (Dansk)</option>
+                                    <option value="Finnish">Finnish (Suomi)</option>
+                                    <option value="Greek">Greek (Ελληνικά)</option>
+                                    <option value="Czech">Czech (Čeština)</option>
+                                    <option value="Hungarian">Hungarian (Magyar)</option>
+                                    <option value="Romanian">Romanian (Română)</option>
+                                    <option value="Turkish">Turkish (Türkçe)</option>
+                                    <option value="Ukrainian">Ukrainian (Українська)</option>
+                                    <option value="Bulgarian">Bulgarian (Български)</option>
+                                    <option value="Croatian">Croatian (Hrvatski)</option>
+                                    <option value="Slovak">Slovak (Slovenčina)</option>
+                                    <option value="Slovenian">Slovenian (Slovenščina)</option>
+                                    <option value="Lithuanian">Lithuanian (Lietuvių)</option>
+                                    <option value="Latvian">Latvian (Latviešu)</option>
+                                    <option value="Estonian">Estonian (Eesti)</option>
+                                    <!-- Asian -->
+                                    <option value="Hindi">Hindi (हिन्दी)</option>
+                                    <option value="Vietnamese">Vietnamese (Tiếng Việt)</option>
+                                    <option value="Thai">Thai (ไทย)</option>
+                                    <option value="Indonesian">Indonesian (Bahasa Indonesia)</option>
+                                    <option value="Malay">Malay (Bahasa Melayu)</option>
+                                    <option value="Filipino">Filipino (Tagalog)</option>
+                                    <option value="Bengali">Bengali (বাংলা)</option>
+                                    <option value="Tamil">Tamil (தமிழ்)</option>
+                                    <option value="Telugu">Telugu (తెలుగు)</option>
+                                    <!-- Middle Eastern -->
+                                    <option value="Hebrew">Hebrew (עברית)</option>
+                                    <option value="Persian">Persian/Farsi (فارسی)</option>
+                                    <option value="Urdu">Urdu (اردو)</option>
                                 </select>
                             </div>
 
@@ -592,16 +719,33 @@ async function showTTSModal(filename, filepath) {
                             <div class="form-group" style="margin-bottom: 0;">
                                 <label style="font-size: 13px;">Target Language</label>
                                 <select id="ttsModalChatterboxLang" class="form-control" style="font-size: 13px;">
+                                    <!-- Most Common -->
                                     <option value="en">English</option>
-                                    <option value="zh">Chinese</option>
-                                    <option value="es">Spanish</option>
-                                    <option value="fr">French</option>
-                                    <option value="de">German</option>
-                                    <option value="it">Italian</option>
-                                    <option value="ja">Japanese</option>
-                                    <option value="ko">Korean</option>
-                                    <option value="pt">Portuguese</option>
-                                    <option value="ru">Russian</option>
+                                    <option value="zh">Chinese (中文)</option>
+                                    <option value="es">Spanish (Español)</option>
+                                    <option value="fr">French (Français)</option>
+                                    <option value="de">German (Deutsch)</option>
+                                    <option value="it">Italian (Italiano)</option>
+                                    <option value="ja">Japanese (日本語)</option>
+                                    <option value="ko">Korean (한국어)</option>
+                                    <option value="pt">Portuguese (Português)</option>
+                                    <option value="ru">Russian (Русский)</option>
+                                    <option value="ar">Arabic (العربية)</option>
+                                    <!-- European -->
+                                    <option value="pl">Polish (Polski)</option>
+                                    <option value="tr">Turkish (Türkçe)</option>
+                                    <option value="nl">Dutch (Nederlands)</option>
+                                    <option value="cs">Czech (Čeština)</option>
+                                    <option value="sv">Swedish (Svenska)</option>
+                                    <option value="da">Danish (Dansk)</option>
+                                    <option value="fi">Finnish (Suomi)</option>
+                                    <option value="hu">Hungarian (Magyar)</option>
+                                    <!-- Asian -->
+                                    <option value="hi">Hindi (हिन्दी)</option>
+                                    <option value="vi">Vietnamese (Tiếng Việt)</option>
+                                    <option value="id">Indonesian (Bahasa Indonesia)</option>
+                                    <!-- Other -->
+                                    <option value="el">Greek (Ελληνικά)</option>
                                 </select>
                             </div>
                             <div class="form-group" style="margin-bottom: 0;">
@@ -748,10 +892,14 @@ if (typeof window !== 'undefined') {
  * Start application when DOM is ready
  */
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializeModules);
+    document.addEventListener('DOMContentLoaded', async () => {
+        await initializeModules();
+    });
 } else {
-    // DOM already loaded
-    initializeModules();
+    // DOM already loaded - initialize immediately
+    (async () => {
+        await initializeModules();
+    })();
 }
 
 // ========================================
@@ -776,5 +924,6 @@ export {
     ResumeManager,
     Validators,
     LifecycleManager,
-    TTSManager
+    TTSManager,
+    StatusManager
 };

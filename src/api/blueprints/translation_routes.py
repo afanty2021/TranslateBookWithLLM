@@ -7,7 +7,6 @@ import copy
 from flask import Blueprint, request, jsonify
 
 from src.config import (
-    MAIN_LINES_PER_CHUNK,
     REQUEST_TIMEOUT,
     OLLAMA_NUM_CTX
 )
@@ -64,15 +63,11 @@ def create_translation_blueprint(state_manager, start_translation_job):
         # Generate unique translation ID
         translation_id = f"trans_{int(time.time() * 1000)}"
 
-        # Debug: Log received prompt_options
-        print(f"[DEBUG] Received prompt_options: {data.get('prompt_options', {})}")
-
         # Build configuration
         config = {
             'source_language': data['source_language'],
             'target_language': data['target_language'],
             'model': data['model'],
-            'chunk_size': int(data.get('chunk_size', MAIN_LINES_PER_CHUNK)),
             'llm_api_endpoint': data['llm_api_endpoint'],
             'request_timeout': int(data.get('timeout', REQUEST_TIMEOUT)),
             'context_window': int(data.get('context_window', OLLAMA_NUM_CTX)),
@@ -83,9 +78,10 @@ def create_translation_blueprint(state_manager, start_translation_job):
             'gemini_api_key': _resolve_api_key(data.get('gemini_api_key'), 'GEMINI_API_KEY'),
             'openai_api_key': _resolve_api_key(data.get('openai_api_key'), 'OPENAI_API_KEY'),
             'openrouter_api_key': _resolve_api_key(data.get('openrouter_api_key'), 'OPENROUTER_API_KEY'),
-            'fast_mode': data.get('fast_mode', False),
             # Prompt options (optional instructions to include in the system prompt)
             'prompt_options': data.get('prompt_options', {}),
+            # Bilingual output (original + translation interleaved)
+            'bilingual_output': data.get('bilingual_output', False),
             # TTS configuration
             'tts_enabled': data.get('tts_enabled', False),
             'tts_config': TTSConfig.from_web_request(data).to_dict() if data.get('tts_enabled') else None

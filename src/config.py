@@ -34,41 +34,50 @@ if _debug_mode:
     _config_logger.debug(f"📁 .env exists: {_env_exists}")
 
 if not _env_exists:
-    print("\n" + "="*70)
-    print("⚠️  WARNING: .env configuration file not found")
-    print("="*70)
-    print("\nThe application will run with default settings, but you may need to")
-    print("configure it for your specific setup.\n")
+    # Check if running as PyInstaller executable
+    _is_frozen = getattr(sys, 'frozen', False)
 
-    if _env_example.exists():
-        print("📋 QUICK SETUP:")
-        print(f"   1. Copy the template: copy .env.example .env")
-        print(f"   2. Edit .env to match your configuration")
-        print(f"   3. Restart the application\n")
+    if not _is_frozen:
+        # Only show the interactive prompt when NOT running as executable
+        print("\n" + "="*70)
+        print("⚠️  WARNING: .env configuration file not found")
+        print("="*70)
+        print("\nThe application will run with default settings, but you may need to")
+        print("configure it for your specific setup.\n")
+
+        if _env_example.exists():
+            print("📋 QUICK SETUP:")
+            print(f"   1. Copy the template: copy .env.example .env")
+            print(f"   2. Edit .env to match your configuration")
+            print(f"   3. Restart the application\n")
+        else:
+            print("📋 MANUAL SETUP:")
+            print(f"   1. Create a .env file in: {Path.cwd()}")
+            print(f"   2. Add your configuration (see documentation)")
+            print(f"   3. Restart the application\n")
+
+        print("🔧 DEFAULT SETTINGS BEING USED:")
+        print(f"   • API Endpoint: http://localhost:11434/api/generate")
+        print(f"   • LLM Provider: ollama")
+        print(f"   • Model: qwen3:14b")
+        print(f"   • Port: 5000")
+        print(f"\n💡 TIP: If using a remote server or different provider, you MUST")
+        print(f"   create a .env file with the correct settings.\n")
+        print("="*70)
+        print("Press Ctrl+C to stop and configure, or wait 5 seconds to continue...")
+        print("="*70 + "\n")
+
+        # Give user time to read and react
+        import time
+        try:
+            time.sleep(5)
+        except KeyboardInterrupt:
+            print("\n\n⏹️  Startup cancelled by user. Please configure .env and try again.\n")
+            sys.exit(0)
     else:
-        print("📋 MANUAL SETUP:")
-        print(f"   1. Create a .env file in: {Path.cwd()}")
-        print(f"   2. Add your configuration (see documentation)")
-        print(f"   3. Restart the application\n")
-
-    print("🔧 DEFAULT SETTINGS BEING USED:")
-    print(f"   • API Endpoint: http://localhost:11434/api/generate")
-    print(f"   • LLM Provider: ollama")
-    print(f"   • Model: qwen3:14b")
-    print(f"   • Port: 5000")
-    print(f"\n💡 TIP: If using a remote server or different provider, you MUST")
-    print(f"   create a .env file with the correct settings.\n")
-    print("="*70)
-    print("Press Ctrl+C to stop and configure, or wait 5 seconds to continue...")
-    print("="*70 + "\n")
-
-    # Give user time to read and react
-    import time
-    try:
-        time.sleep(5)
-    except KeyboardInterrupt:
-        print("\n\n⏹️  Startup cancelled by user. Please configure .env and try again.\n")
-        sys.exit(0)
+        # Running as executable - silently use defaults
+        if _debug_mode:
+            _config_logger.debug("⚠️  .env not found, using defaults (executable mode)")
 
 # Load .env file if it exists
 _dotenv_result = load_dotenv(_env_file)
@@ -77,12 +86,16 @@ if _debug_mode:
     _config_logger.debug(f"📁 Loaded .env from: {_env_file.absolute()}")
 
 # Load from environment variables with defaults
-API_ENDPOINT = os.getenv('API_ENDPOINT', 'http://localhost:11434/api/generate')
+# Ollama endpoint configuration (provider-specific)
+OLLAMA_API_ENDPOINT = os.getenv('OLLAMA_API_ENDPOINT', 'http://localhost:11434/api/generate')
+# OpenAI-compatible endpoint configuration (for OpenAI, LM Studio, etc.)
+OPENAI_API_ENDPOINT = os.getenv('OPENAI_API_ENDPOINT', 'https://api.openai.com/v1/chat/completions')
+# Legacy API_ENDPOINT for backward compatibility (defaults to Ollama endpoint)
+API_ENDPOINT = os.getenv('API_ENDPOINT', OLLAMA_API_ENDPOINT)
 DEFAULT_MODEL = os.getenv('DEFAULT_MODEL', 'qwen3:14b')
 PORT = int(os.getenv('PORT', '5000'))
-MAIN_LINES_PER_CHUNK = int(os.getenv('MAIN_LINES_PER_CHUNK', '25'))
 REQUEST_TIMEOUT = int(os.getenv('REQUEST_TIMEOUT', '900'))
-OLLAMA_NUM_CTX = int(os.getenv('OLLAMA_NUM_CTX', '2048'))
+OLLAMA_NUM_CTX = int(os.getenv('OLLAMA_NUM_CTX', '4096'))
 
 # =============================================================================
 # THINKING MODEL CONFIGURATION
@@ -114,12 +127,13 @@ CONTROLLABLE_THINKING_MODELS = [
     "qwen3:4b",       # Smaller Qwen3 models likely controllable
     "qwen3:1.7b",     # Smaller Qwen3 models likely controllable
     "qwen3:0.6b",     # Smaller Qwen3 models likely controllable
+    "qwen3.5:9b",     # Qwen3.5 tested
+    "qwen3.5:35b",    # Qwen3.5 large - controllable
 ]
 
 # Legacy alias for backward compatibility
 THINKING_MODELS = UNCONTROLLABLE_THINKING_MODELS + CONTROLLABLE_THINKING_MODELS
 MAX_TRANSLATION_ATTEMPTS = int(os.getenv('MAX_TRANSLATION_ATTEMPTS', '2'))
-RETRY_DELAY_SECONDS = int(os.getenv('RETRY_DELAY_SECONDS', '2'))
 
 # Adaptive context optimization settings
 # The new strategy starts at a small context and grows as needed based on actual token usage
@@ -143,13 +157,31 @@ MIN_CHUNK_SIZE = int(os.getenv("MIN_CHUNK_SIZE", "5"))
 MAX_CHUNK_SIZE = int(os.getenv("MAX_CHUNK_SIZE", "100"))
 
 # Token-based chunking configuration
-# When enabled, uses tiktoken to count tokens instead of lines for more consistent chunk sizes
-USE_TOKEN_CHUNKING = os.getenv('USE_TOKEN_CHUNKING', 'true').lower() == 'true'
+# All file types use token-based chunking with tiktoken for consistent chunk sizes
 MAX_TOKENS_PER_CHUNK = int(os.getenv('MAX_TOKENS_PER_CHUNK', '450'))
 SOFT_LIMIT_RATIO = float(os.getenv('SOFT_LIMIT_RATIO', '0.8'))
 
+# === Translation Buffer Configuration ===
+TRANSLATION_OUTPUT_MULTIPLIER = 2
+"""Multiplicateur pour la longueur de sortie estimée (certaines langues cibles
+peuvent être 2x plus longues que la source)"""
+
+TRANSLATION_TAG_OVERHEAD = 50
+"""Tokens réservés pour les balises XML de traduction (<Translated>...</Translated>)"""
+
+# === Placeholder Validation ===
+MAX_PLACEHOLDER_RETRIES = 3
+"""Nombre maximum de tentatives de validation des placeholders"""
+
+MAX_PLACEHOLDER_CORRECTION_ATTEMPTS = 2
+"""Nombre maximum de tentatives de correction LLM pour les placeholders malformés"""
+
+# === Chunking Limits ===
+MIN_CHUNK_SIZE_TOKENS = 50
+"""Taille minimale d'un chunk pour éviter la sur-fragmentation"""
+
 # LLM Provider configuration
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')  # 'ollama', 'gemini', 'openai', or 'openrouter'
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')  # 'ollama', 'gemini', 'openai', 'openrouter', 'mistral', 'deepseek', or 'poe'
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
@@ -159,43 +191,43 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.getenv('OPENROUTER_MODEL', 'anthropic/claude-sonnet-4')
 OPENROUTER_API_ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions'
 
+# Mistral AI configuration
+MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY', '')
+MISTRAL_MODEL = os.getenv('MISTRAL_MODEL', 'mistral-large-latest')
+MISTRAL_API_ENDPOINT = os.getenv('MISTRAL_API_ENDPOINT', 'https://api.mistral.ai/v1/chat/completions')
+
+# DeepSeek configuration (Chinese LLM, very cost-effective)
+DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY', '')
+DEEPSEEK_MODEL = os.getenv('DEEPSEEK_MODEL', 'deepseek-chat')
+DEEPSEEK_API_ENDPOINT = os.getenv('DEEPSEEK_API_ENDPOINT', 'https://api.deepseek.com/chat/completions')
+
+# Poe configuration (access to Claude, GPT, Gemini, Llama, Grok via single API)
+POE_API_KEY = os.getenv('POE_API_KEY', '')
+POE_MODEL = os.getenv('POE_MODEL', 'Claude-Sonnet-4')
+POE_API_ENDPOINT = os.getenv('POE_API_ENDPOINT', 'https://api.poe.com/v1/chat/completions')
+# NVIDIA NIM configuration (hosted cloud API for Llama, Mistral, and other models)
+NIM_API_KEY = os.getenv('NIM_API_KEY', '')
+NIM_MODEL = os.getenv('NIM_MODEL', 'meta/llama-3.1-8b-instruct')
+NIM_API_ENDPOINT = os.getenv('NIM_API_ENDPOINT', 'https://integrate.api.nvidia.com/v1/chat/completions')
+
 # SRT-specific configuration
 SRT_LINES_PER_BLOCK = int(os.getenv('SRT_LINES_PER_BLOCK', '5'))
 SRT_MAX_CHARS_PER_BLOCK = int(os.getenv('SRT_MAX_CHARS_PER_BLOCK', '500'))
 
-# Translation signature configuration
-# This adds a discrete attribution to translations to support the project.
-# The signature is non-intrusive: EPUB metadata, text file footer, or SRT comment.
-# Please consider keeping this enabled to help others discover this free, open-source tool!
-# Your support helps maintain and improve the project. Thank you!
-SIGNATURE_ENABLED = os.getenv('SIGNATURE_ENABLED', 'true').lower() == 'true'
-PROJECT_NAME = "TranslateBook with LLM (TBL)"
-PROJECT_GITHUB = "https://github.com/hydropix/TranslateBookWithLLM"
-SIGNATURE_VERSION = "1.0"
+# Translation Attribution
+# This adds a discrete attribution to your translations (metadata for EPUB, footer for TXT, comment for SRT)
+# Please consider keeping this enabled to support the project and help others discover this free tool!
+# The attribution is non-intrusive and placed at the end of files. Thank you for your support!
+ATTRIBUTION_ENABLED = os.getenv('ATTRIBUTION_ENABLED', os.getenv('SIGNATURE_ENABLED', 'true')).lower() == 'true'
+GENERATOR_NAME = "TranslateBook with LLM (TBL)"
+GENERATOR_SOURCE = "https://github.com/hydropix/TranslateBookWithLLM"
+METADATA_VERSION = "1.0"
 
-# Fast Mode Image Preservation
-# When enabled, images from the original EPUB are preserved in fast mode output
-FAST_MODE_PRESERVE_IMAGES = os.getenv('FAST_MODE_PRESERVE_IMAGES', 'true').lower() == 'true'
-# Marker used to track image positions in text (sent to LLM, must be preserved)
-# Format: [IMG001] - minimal format for maximum LLM reliability
-IMAGE_MARKER_PREFIX = "[IMG"
-IMAGE_MARKER_SUFFIX = "]"
-
-# Fast Mode Formatting Preservation
-# When enabled, inline formatting (bold, italic) is preserved using markers
-FAST_MODE_PRESERVE_FORMATTING = os.getenv('FAST_MODE_PRESERVE_FORMATTING', 'true').lower() == 'true'
-# Markers for inline formatting - designed to be simple and LLM-friendly
-# These wrap text that should be formatted: [I]italic text[/I], [B]bold text[/B]
-FORMAT_ITALIC_START = "[I]"
-FORMAT_ITALIC_END = "[/I]"
-FORMAT_BOLD_START = "[B]"
-FORMAT_BOLD_END = "[/B]"
-# Horizontal rule marker (standalone, no content)
-FORMAT_HR_MARKER = "[HR]"
-
-# Default languages from environment
-DEFAULT_SOURCE_LANGUAGE = os.getenv('DEFAULT_SOURCE_LANGUAGE', 'English')
-DEFAULT_TARGET_LANGUAGE = os.getenv('DEFAULT_TARGET_LANGUAGE', 'Chinese')
+# Default languages from environment (optional)
+# Source language: Auto-detected from file content (langdetect)
+# Target language: Auto-detected from browser language in UI
+DEFAULT_SOURCE_LANGUAGE = os.getenv('DEFAULT_SOURCE_LANGUAGE', '')  # Empty = auto-detect
+DEFAULT_TARGET_LANGUAGE = os.getenv('DEFAULT_TARGET_LANGUAGE', '')  # Empty = use browser language
 
 # ============================================================================
 # PROMPT OPTIONS CONFIGURATION
@@ -203,13 +235,18 @@ DEFAULT_TARGET_LANGUAGE = os.getenv('DEFAULT_TARGET_LANGUAGE', 'Chinese')
 # These options control which optional sections are included in the system prompt.
 # Each option can be enabled/disabled via the web interface or CLI.
 
-# Technical Content Preservation (for technical documents)
-# When enabled, instructs the LLM to NOT translate code, paths, URLs, etc.
-PROMPT_PRESERVE_TECHNICAL_CONTENT = os.getenv('PROMPT_PRESERVE_TECHNICAL_CONTENT', 'false').lower() == 'true'
+# Technical Content Preservation (always enabled)
+# Automatically detects and preserves code, paths, URLs, formulas, etc.
+# This is always active as it has no negative impact on literary texts.
+PROMPT_PRESERVE_TECHNICAL_CONTENT = True
 
 # Server configuration
 HOST = os.getenv('HOST', '127.0.0.1')
 OUTPUT_DIR = os.getenv('OUTPUT_DIR', 'translated_files')
+
+# Output filename pattern
+# Placeholders: {originalName}, {targetLang}, {sourceLang}, {model}, {date}, {datetime}, {ext}
+OUTPUT_FILENAME_PATTERN = os.getenv('OUTPUT_FILENAME_PATTERN', '{originalName} ({targetLang}).{ext}')
 
 # Debug mode (reload after .env is loaded)
 DEBUG_MODE = os.getenv('DEBUG_MODE', 'false').lower() == 'true'
@@ -233,6 +270,12 @@ if DEBUG_MODE or _debug_mode:
     _config_logger.debug(f"   OPENAI_API_KEY: {'***' + OPENAI_API_KEY[-4:] if OPENAI_API_KEY else '(not set)'}")
     _config_logger.debug(f"   OPENROUTER_API_KEY: {'***' + OPENROUTER_API_KEY[-4:] if OPENROUTER_API_KEY else '(not set)'}")
     _config_logger.debug(f"   OPENROUTER_MODEL: {OPENROUTER_MODEL}")
+    _config_logger.debug(f"   MISTRAL_API_KEY: {'***' + MISTRAL_API_KEY[-4:] if MISTRAL_API_KEY else '(not set)'}")
+    _config_logger.debug(f"   MISTRAL_MODEL: {MISTRAL_MODEL}")
+    _config_logger.debug(f"   DEEPSEEK_API_KEY: {'***' + DEEPSEEK_API_KEY[-4:] if DEEPSEEK_API_KEY else '(not set)'}")
+    _config_logger.debug(f"   DEEPSEEK_MODEL: {DEEPSEEK_MODEL}")
+    _config_logger.debug(f"   POE_API_KEY: {'***' + POE_API_KEY[-4:] if POE_API_KEY else '(not set)'}")
+    _config_logger.debug(f"   POE_MODEL: {POE_MODEL}")
     _config_logger.debug("="*60)
 
 # Translation tags - Improved for LLM clarity and reliability
@@ -246,76 +289,104 @@ INPUT_TAG_OUT = "</SOURCE_TEXT>"
 # ============================================================================
 # These placeholders are used to temporarily replace HTML/XML tags during
 # translation. The LLM must preserve them exactly in its output.
+#
+# Unified format: [id0], [id1], [id2], ...
+# - Semantic naming helps LLM understand these are identifiers
+# - Compact format reduces token usage
+# - Adjacent tags are grouped into single placeholders
+# - Strict validation ensures placeholder integrity
 
-PLACEHOLDER_TAG_KEYWORD = "TAG"
-"""The keyword used in placeholders (e.g., TAG in [TAG0])"""
-
-PLACEHOLDER_PREFIX = f"[{PLACEHOLDER_TAG_KEYWORD}"
-"""Prefix for tag placeholders (e.g., [TAG in [TAG0])"""
+# Single unified format
+PLACEHOLDER_PREFIX = "[id"
+"""Prefix for tag placeholders (e.g., [id in [id0])"""
 
 PLACEHOLDER_SUFFIX = "]"
-"""Suffix for tag placeholders (e.g., ] in [TAG0])"""
+"""Suffix for tag placeholders (e.g., ] in [id0])"""
 
-PLACEHOLDER_PATTERN = rf'\[{PLACEHOLDER_TAG_KEYWORD}\d+\]'
-"""Regex pattern for detecting tag placeholders in translated text (e.g., [TAG0])"""
+PLACEHOLDER_PATTERN = r'\[id(\d+)\]'
+"""Regex pattern for placeholders (e.g., [id0])"""
 
-# Mutation patterns - alternative formats LLMs might produce
-PLACEHOLDER_DOUBLE_BRACKET_PATTERN = rf'\[\[{PLACEHOLDER_TAG_KEYWORD}\d+\]\]'
-"""Pattern for double bracket mutation (e.g., [[TAG0]])"""
+# Maximum retries for placeholder validation before falling back to source text
+MAX_PLACEHOLDER_RETRIES = 0
+"""Number of retry attempts when placeholder validation fails"""
 
-PLACEHOLDER_SINGLE_BRACKET_PATTERN = rf'\[{PLACEHOLDER_TAG_KEYWORD}\d+\]'
-"""Pattern for single bracket mutation (e.g., [TAG0])"""
+MAX_PLACEHOLDER_CORRECTION_ATTEMPTS = 0
+"""Number of LLM correction attempts before falling back to proportional insertion (0 = skip correction phase entirely)"""
 
-PLACEHOLDER_CURLY_BRACE_PATTERN = rf'\{{{PLACEHOLDER_TAG_KEYWORD}\d+\}}'
-"""Pattern for curly brace mutation (e.g., {TAG0})"""
+# =============================================================================
+# TOKEN ALIGNMENT FALLBACK CONFIGURATION (Phase 2)
+# =============================================================================
+# When LLM fails to preserve placeholders correctly, use word-level alignment
+# to reinsert them at semantically correct positions.
 
-PLACEHOLDER_ANGLE_BRACKET_PATTERN = rf'<{PLACEHOLDER_TAG_KEYWORD}\d+>'
-"""Pattern for angle bracket mutation (e.g., <TAG0>)"""
+EPUB_TOKEN_ALIGNMENT_ENABLED = os.getenv('EPUB_TOKEN_ALIGNMENT_ENABLED', 'true').lower() == 'true'
+"""Enable token alignment fallback for EPUB translation (Phase 2)"""
 
-PLACEHOLDER_BARE_PATTERN = rf'{PLACEHOLDER_TAG_KEYWORD}\d+'
-"""Pattern for bare TAG without brackets (e.g., TAG0)"""
-
-# Orphaned bracket patterns for cleanup
-ORPHANED_DOUBLE_BRACKETS_PATTERN = r'\[\[|\]\]'
-"""Pattern for orphaned double brackets"""
-
-ORPHANED_UNICODE_BRACKETS_PATTERN = r'⟦|⟧'
-"""Pattern for orphaned Unicode brackets (legacy format)"""
-
-ORPHANED_SINGLE_BRACKETS_PATTERN = r'(?<!\[)\[(?!\[)|(?<!\])\](?!\])'
-"""Pattern for orphaned single brackets (current format)"""
+EPUB_TOKEN_ALIGNMENT_METHOD = os.getenv('EPUB_TOKEN_ALIGNMENT_METHOD', 'proportional')
+"""
+Alignment method to use:
+- 'proportional': Simple position-based alignment (fast, no dependencies)
+- 'advanced': Future - could add ML-based alignment
+"""
 
 
-def create_placeholder(tag_num: int) -> str:
-    """Create a placeholder string for a given tag number."""
-    return f"{PLACEHOLDER_PREFIX}{tag_num}{PLACEHOLDER_SUFFIX}"
-
-
-def create_example_placeholder() -> str:
-    """Create an example placeholder for documentation/prompts."""
-    return create_placeholder(0)
-
-
-def get_mutation_variants(tag_num) -> list:
+def detect_placeholder_mode(text: str) -> tuple:
     """
-    Get all possible mutation variants for a given tag number.
-
-    These are alternative formats that LLMs might produce instead of
-    the correct placeholder format.
+    Returns the unified placeholder format [idN].
 
     Args:
-        tag_num: The tag number (e.g., 0 for TAG0) - can be int or str
+        text: Text (parameter kept for backward compatibility but unused)
 
     Returns:
-        List of possible mutation strings
+        Tuple of (prefix, suffix, pattern) for the [idN] format
     """
-    return [
-        f"[[{PLACEHOLDER_TAG_KEYWORD}{tag_num}]]",   # Double brackets
-        f"{{{PLACEHOLDER_TAG_KEYWORD}{tag_num}}}",   # Curly braces
-        f"<{PLACEHOLDER_TAG_KEYWORD}{tag_num}>",     # Angle brackets
-        f"⟦{PLACEHOLDER_TAG_KEYWORD}{tag_num}⟧",     # Unicode brackets (legacy)
-        f"{PLACEHOLDER_TAG_KEYWORD}{tag_num}",       # No brackets (check last)
-    ]
+    return (PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PLACEHOLDER_PATTERN)
+
+
+def create_placeholder(tag_num: int, prefix: str = None, suffix: str = None) -> str:
+    """
+    Create a placeholder string for a given tag number.
+
+    Args:
+        tag_num: Tag number
+        prefix: Optional custom prefix (defaults to PLACEHOLDER_PREFIX)
+        suffix: Optional custom suffix (defaults to PLACEHOLDER_SUFFIX)
+
+    Returns:
+        Placeholder string like [id0]
+    """
+    if prefix is None:
+        prefix = PLACEHOLDER_PREFIX
+    if suffix is None:
+        suffix = PLACEHOLDER_SUFFIX
+    return f"{prefix}{tag_num}{suffix}"
+
+
+def create_example_placeholder(prefix: str = None, suffix: str = None) -> str:
+    """
+    Create an example placeholder for documentation/prompts.
+
+    Args:
+        prefix: Optional custom prefix
+        suffix: Optional custom suffix
+
+    Returns:
+        Example placeholder like [id0]
+    """
+    return create_placeholder(0, prefix, suffix)
+
+
+def detect_format_from_placeholder(sample_placeholder: str) -> str:
+    """
+    Returns the unified format name.
+
+    Args:
+        sample_placeholder: A sample placeholder (parameter kept for backward compatibility)
+
+    Returns:
+        Format name (always "id" for [idN] format)
+    """
+    return "id"
 
 
 # Sentence terminators
@@ -354,8 +425,8 @@ MODEL_FAMILY_CONTEXT_DEFAULTS = {
     "gpt-4": 128000,  # Must come before "gpt"
     "gpt": 8192,
     "claude": 100000,
-    "deepseek": 16384,
-    "mistral": 8192,
+    "deepseek": 64000,  # DeepSeek V3 models have 64K context
+    "mistral": 32000,  # Mistral small has 32K, large/medium have 128K
     "gemma": 8192,
     "qwen": 8192,
     "llama": 4096,
@@ -379,14 +450,15 @@ class TranslationConfig:
     gemini_api_key: str = GEMINI_API_KEY
     openai_api_key: str = OPENAI_API_KEY
     openrouter_api_key: str = OPENROUTER_API_KEY
-    
-    # Translation parameters
-    chunk_size: int = MAIN_LINES_PER_CHUNK
-    
+    mistral_api_key: str = MISTRAL_API_KEY
+    deepseek_api_key: str = DEEPSEEK_API_KEY
+    poe_api_key: str = POE_API_KEY
+    nim_api_key: str = NIM_API_KEY
+
     # LLM parameters
     timeout: int = REQUEST_TIMEOUT
     max_attempts: int = MAX_TRANSLATION_ATTEMPTS
-    retry_delay: int = RETRY_DELAY_SECONDS
+    retry_delay: int = 2  # Fixed retry delay in seconds
     context_window: int = OLLAMA_NUM_CTX
 
     # Context optimization
@@ -395,7 +467,6 @@ class TranslationConfig:
     max_chunk_size: int = MAX_CHUNK_SIZE
 
     # Token-based chunking
-    use_token_chunking: bool = USE_TOKEN_CHUNKING
     max_tokens_per_chunk: int = MAX_TOKENS_PER_CHUNK
     soft_limit_ratio: float = SOFT_LIMIT_RATIO
 
@@ -412,14 +483,16 @@ class TranslationConfig:
             target_language=args.target_lang,
             model=args.model,
             api_endpoint=args.api_endpoint,
-            chunk_size=args.chunksize,
             interface_type="cli",
             enable_colors=not args.no_color,
             llm_provider=getattr(args, 'provider', LLM_PROVIDER),
             gemini_api_key=getattr(args, 'gemini_api_key', GEMINI_API_KEY),
             openai_api_key=getattr(args, 'openai_api_key', OPENAI_API_KEY),
             openrouter_api_key=getattr(args, 'openrouter_api_key', OPENROUTER_API_KEY),
-            use_token_chunking=getattr(args, 'use_token_chunking', USE_TOKEN_CHUNKING),
+            mistral_api_key=getattr(args, 'mistral_api_key', MISTRAL_API_KEY),
+            deepseek_api_key=getattr(args, 'deepseek_api_key', DEEPSEEK_API_KEY),
+            poe_api_key=getattr(args, 'poe_api_key', POE_API_KEY),
+            nim_api_key=getattr(args, 'nim_api_key', NIM_API_KEY),
             max_tokens_per_chunk=getattr(args, 'max_tokens_per_chunk', MAX_TOKENS_PER_CHUNK),
             soft_limit_ratio=getattr(args, 'soft_limit_ratio', SOFT_LIMIT_RATIO)
         )
@@ -432,10 +505,9 @@ class TranslationConfig:
             target_language=request_data.get('target_language', DEFAULT_TARGET_LANGUAGE),
             model=request_data.get('model', DEFAULT_MODEL),
             api_endpoint=request_data.get('llm_api_endpoint', API_ENDPOINT),
-            chunk_size=request_data.get('chunk_size', MAIN_LINES_PER_CHUNK),
             timeout=request_data.get('timeout', REQUEST_TIMEOUT),
             max_attempts=request_data.get('max_attempts', MAX_TRANSLATION_ATTEMPTS),
-            retry_delay=request_data.get('retry_delay', RETRY_DELAY_SECONDS),
+            retry_delay=request_data.get('retry_delay', 2),
             context_window=request_data.get('context_window', OLLAMA_NUM_CTX),
             auto_adjust_context=request_data.get('auto_adjust_context', AUTO_ADJUST_CONTEXT),
             min_chunk_size=request_data.get('min_chunk_size', MIN_CHUNK_SIZE),
@@ -446,7 +518,10 @@ class TranslationConfig:
             gemini_api_key=request_data.get('gemini_api_key', GEMINI_API_KEY),
             openai_api_key=request_data.get('openai_api_key', OPENAI_API_KEY),
             openrouter_api_key=request_data.get('openrouter_api_key', OPENROUTER_API_KEY),
-            use_token_chunking=request_data.get('use_token_chunking', USE_TOKEN_CHUNKING),
+            mistral_api_key=request_data.get('mistral_api_key', MISTRAL_API_KEY),
+            deepseek_api_key=request_data.get('deepseek_api_key', DEEPSEEK_API_KEY),
+            poe_api_key=request_data.get('poe_api_key', POE_API_KEY),
+            nim_api_key=request_data.get('nim_api_key', NIM_API_KEY),
             max_tokens_per_chunk=request_data.get('max_tokens_per_chunk', MAX_TOKENS_PER_CHUNK),
             soft_limit_ratio=request_data.get('soft_limit_ratio', SOFT_LIMIT_RATIO)
         )
@@ -458,7 +533,6 @@ class TranslationConfig:
             'target_language': self.target_language,
             'model': self.model,
             'api_endpoint': self.api_endpoint,
-            'chunk_size': self.chunk_size,
             'timeout': self.timeout,
             'max_attempts': self.max_attempts,
             'retry_delay': self.retry_delay,
@@ -467,7 +541,44 @@ class TranslationConfig:
             'gemini_api_key': self.gemini_api_key,
             'openai_api_key': self.openai_api_key,
             'openrouter_api_key': self.openrouter_api_key,
-            'use_token_chunking': self.use_token_chunking,
+            'mistral_api_key': self.mistral_api_key,
+            'deepseek_api_key': self.deepseek_api_key,
+            'poe_api_key': self.poe_api_key,
+            'nim_api_key': self.nim_api_key,
             'max_tokens_per_chunk': self.max_tokens_per_chunk,
             'soft_limit_ratio': self.soft_limit_ratio
         }
+
+
+def detect_placeholder_format_in_text(text: str) -> tuple:
+    """
+    Returns the unified placeholder format [idN].
+
+    Args:
+        text: Text (parameter kept for backward compatibility but unused)
+
+    Returns:
+        (prefix, suffix) tuple for [idN] format
+
+    Example:
+        >>> detect_placeholder_format_in_text("Hello [id0] world [id1]")
+        ("[id", "]")
+    """
+    return PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX
+
+
+def detect_existing_placeholder_format(text: str) -> tuple:
+    """
+    Returns the unified placeholder format [idN].
+
+    Args:
+        text: Text (parameter kept for backward compatibility but unused)
+
+    Returns:
+        Tuple of (prefix, suffix, pattern) for the [idN] format
+
+    Example:
+        >>> detect_existing_placeholder_format("Hello [id0] world [id1]")
+        ("[id", "]", r'\\[id(\\d+)\\]')
+    """
+    return (PLACEHOLDER_PREFIX, PLACEHOLDER_SUFFIX, PLACEHOLDER_PATTERN)

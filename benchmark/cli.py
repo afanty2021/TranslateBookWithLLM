@@ -12,11 +12,15 @@ import asyncio
 import sys
 from typing import Optional
 
-from benchmark.config import BenchmarkConfig, DEFAULT_EVALUATOR_MODEL
+from benchmark.config import BenchmarkConfig, DEFAULT_EVALUATOR_MODEL, DEFAULT_EVALUATOR_PROVIDER, DEFAULT_POE_EVALUATOR_MODEL
 from benchmark.runner import BenchmarkRunner, quick_benchmark, full_benchmark
 from benchmark.results.storage import ResultsStorage
 from benchmark.wiki.generator import WikiGenerator
-from benchmark.translator import get_available_ollama_models, get_available_openrouter_models
+from benchmark.translator import (
+    get_available_ollama_models,
+    get_available_openrouter_models,
+    get_available_openai_models,
+)
 
 
 # ANSI color codes for terminal output
@@ -72,11 +76,16 @@ def cmd_run(args: argparse.Namespace) -> int:
     provider = getattr(args, 'provider', 'ollama') or 'ollama'
 
     # Build configuration
+    evaluator_provider = getattr(args, 'evaluator_provider', DEFAULT_EVALUATOR_PROVIDER)
     config = BenchmarkConfig.from_cli_args(
         openrouter_key=args.openrouter_key,
+        openai_key=args.openai_key,
+        openai_endpoint=args.openai_endpoint,
+        poe_key=args.poe_key,
         evaluator_model=args.evaluator,
         ollama_endpoint=args.ollama_endpoint,
         translation_provider=provider,
+        evaluator_provider=evaluator_provider,
     )
 
     # Validate configuration
@@ -96,6 +105,14 @@ def cmd_run(args: argparse.Namespace) -> int:
                 log_callback("error", "No OpenRouter models available.")
                 return 1
             # Extract model IDs
+            models = [m["id"] if isinstance(m, dict) else m for m in models_data[:10]]
+            print(colored(f"Found {len(models_data)} models. Using top 10: {', '.join(models[:3])}...", Colors.GREEN))
+        elif provider == "openai":
+            print(colored("Fetching available OpenAI-compatible models...", Colors.CYAN))
+            models_data = asyncio.run(get_available_openai_models(config))
+            if not models_data:
+                log_callback("error", "No OpenAI-compatible models available.")
+                return 1
             models = [m["id"] if isinstance(m, dict) else m for m in models_data[:10]]
             print(colored(f"Found {len(models_data)} models. Using top 10: {', '.join(models[:3])}...", Colors.GREEN))
         else:
@@ -285,7 +302,12 @@ def cmd_models(args: argparse.Namespace) -> int:
     """List available models for benchmarking."""
     print_banner()
 
-    config = BenchmarkConfig.from_cli_args(openrouter_key=args.openrouter_key)
+    config = BenchmarkConfig.from_cli_args(
+        openrouter_key=args.openrouter_key,
+        openai_key=args.openai_key,
+        openai_endpoint=args.openai_endpoint,
+        translation_provider=args.provider,
+    )
     provider = args.provider
 
     if provider == "openrouter":
@@ -318,6 +340,32 @@ def cmd_models(args: argparse.Namespace) -> int:
         print()
         print(colored("Tip: Use -m to specify models, e.g.:", Colors.YELLOW))
         print("  python -m benchmark.cli run -p openrouter -m anthropic/claude-sonnet-4 openai/gpt-4o")
+
+    elif provider == "openai":
+        print(colored("Fetching OpenAI-compatible models...\n", Colors.CYAN))
+        models = asyncio.run(get_available_openai_models(config))
+
+        if not models:
+            log_callback("error", "Failed to fetch OpenAI-compatible models")
+            return 1
+
+        print(colored(f"Available OpenAI-Compatible Models ({len(models)}):\n", Colors.BOLD))
+        print(f"{'Model ID':<50} {'Owner':<20}")
+        print("-" * 72)
+
+        for model in models[:50]:
+            if isinstance(model, dict):
+                model_id = model.get("id", "unknown")
+                owned_by = model.get("owned_by", "unknown")
+            else:
+                model_id = model
+                owned_by = "unknown"
+
+            print(f"{model_id:<50} {owned_by:<20}")
+
+        print()
+        print(colored("Tip: Use -m and --openai-endpoint to specify a backend, e.g.:", Colors.YELLOW))
+        print("  python -m benchmark.cli run -p openai --openai-endpoint http://localhost:8080/v1 -m your-model")
 
     else:
         print(colored("Detecting Ollama models...\n", Colors.CYAN))
@@ -563,6 +611,9 @@ Examples:
   # Quick benchmark with Ollama (local models)
   python -m benchmark.cli run --openrouter-key YOUR_KEY
 
+    # Quick benchmark with an OpenAI-compatible backend
+    python -m benchmark.cli run --provider openai --openai-endpoint http://localhost:8080/v1 -m your-model
+
   # Quick benchmark with OpenRouter (cloud models)
   python -m benchmark.cli run --provider openrouter --openrouter-key YOUR_KEY
 
@@ -574,6 +625,9 @@ Examples:
 
   # Specific OpenRouter models
   python -m benchmark.cli run -p openrouter -m anthropic/claude-sonnet-4 openai/gpt-4o -l fr de ja
+
+    # Specific OpenAI-compatible backend and models
+    python -m benchmark.cli run -p openai --openai-endpoint http://localhost:8080/v1 -m qwen2.5-14b-instruct
 
   # Generate wiki pages
   python -m benchmark.cli wiki
@@ -591,6 +645,7 @@ Examples:
         "-m", "--models",
         nargs="+",
         help="Models to benchmark. For Ollama: model names (e.g., llama3:8b). "
+             "For OpenAI-compatible backends: model IDs (e.g., gpt-4o or local server model names). "
              "For OpenRouter: model IDs (e.g., anthropic/claude-sonnet-4). "
              "If not specified, auto-detects available models."
     )
@@ -606,9 +661,17 @@ Examples:
     )
     run_parser.add_argument(
         "-p", "--provider",
-        choices=["ollama", "openrouter"],
+        choices=["ollama", "openai", "openrouter"],
         default="ollama",
-        help="Translation provider: 'ollama' (local, default) or 'openrouter' (cloud, 200+ models)"
+        help="Translation provider: 'ollama' (local, default), 'openai' (OpenAI-compatible), or 'openrouter' (cloud, 200+ models)"
+    )
+    run_parser.add_argument(
+        "--openai-key",
+        help="API key for OpenAI-compatible translation backends. Can also be set via OPENAI_API_KEY env var."
+    )
+    run_parser.add_argument(
+        "--openai-endpoint",
+        help="OpenAI-compatible chat completions endpoint or /v1 base URL. Can also be set via OPENAI_API_ENDPOINT env var."
     )
     run_parser.add_argument(
         "--openrouter-key",
@@ -616,9 +679,21 @@ Examples:
              "Can also be set via OPENROUTER_API_KEY env var."
     )
     run_parser.add_argument(
+        "--evaluator-provider",
+        choices=["openrouter", "poe"],
+        default=DEFAULT_EVALUATOR_PROVIDER,
+        help=f"Provider for evaluation (default: {DEFAULT_EVALUATOR_PROVIDER})"
+    )
+    run_parser.add_argument(
         "--evaluator",
-        default=DEFAULT_EVALUATOR_MODEL,
-        help=f"OpenRouter model for evaluation (default: {DEFAULT_EVALUATOR_MODEL})"
+        default=None,
+        help=f"Model for evaluation (default: {DEFAULT_EVALUATOR_MODEL} for OpenRouter, "
+             f"{DEFAULT_POE_EVALUATOR_MODEL} for Poe)"
+    )
+    run_parser.add_argument(
+        "--poe-key",
+        help="Poe API key (for evaluation if using --evaluator-provider poe). "
+             "Can also be set via POE_API_KEY env var."
     )
     run_parser.add_argument(
         "--ollama-endpoint",
@@ -681,9 +756,17 @@ Examples:
     models_parser = subparsers.add_parser("models", help="List available models for benchmarking")
     models_parser.add_argument(
         "-p", "--provider",
-        choices=["ollama", "openrouter"],
+        choices=["ollama", "openai", "openrouter"],
         default="ollama",
         help="Provider to list models for (default: ollama)"
+    )
+    models_parser.add_argument(
+        "--openai-key",
+        help="API key for listing models from an OpenAI-compatible endpoint"
+    )
+    models_parser.add_argument(
+        "--openai-endpoint",
+        help="OpenAI-compatible endpoint to query for available models"
     )
     models_parser.add_argument(
         "--openrouter-key",

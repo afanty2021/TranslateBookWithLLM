@@ -237,6 +237,30 @@ export const ApiClient = {
         });
     },
 
+    /**
+     * Verify which uploaded files still exist on the server
+     * @param {string[]} filePaths - Array of file paths to verify
+     * @returns {Promise<Object>} Object with existing and missing file paths
+     */
+    async verifyUploadedFiles(filePaths) {
+        return await apiRequest('/api/uploads/verify', {
+            method: 'POST',
+            body: JSON.stringify({ file_paths: filePaths })
+        });
+    },
+
+    /**
+     * Detect language from an uploaded file
+     * @param {string} filePath - Path to the uploaded file
+     * @returns {Promise<Object>} Detection result with detected_language and language_confidence
+     */
+    async detectLanguage(filePath) {
+        return await apiRequest('/api/detect-language', {
+            method: 'POST',
+            body: JSON.stringify({ file_path: filePath })
+        });
+    },
+
     // ========================================
     // Model Management
     // ========================================
@@ -329,6 +353,24 @@ export const ApiClient = {
         return await apiRequest('/api/settings', {
             method: 'POST',
             body: JSON.stringify(settings)
+        });
+    },
+
+    /**
+     * Get available custom instruction files
+     * @returns {Promise<Object>} Custom instructions list with files array
+     */
+    async getCustomInstructions() {
+        return await apiRequest('/api/custom-instructions');
+    },
+
+    /**
+     * Open the Custom_Instructions folder in the system file explorer
+     * @returns {Promise<Object>} Result with success status
+     */
+    async openCustomInstructionsFolder() {
+        return await apiRequest('/api/custom-instructions/open-folder', {
+            method: 'POST'
         });
     },
 
@@ -436,7 +478,3 @@ export const ApiClient = {
     }
 };
 
-// Make API client available globally for debugging
-if (typeof window !== 'undefined') {
-    window.__API_CLIENT__ = ApiClient;
-}

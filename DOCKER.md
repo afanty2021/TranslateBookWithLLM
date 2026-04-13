@@ -7,7 +7,7 @@ This guide explains how to use the official Docker images published to GitHub Co
 ### Pull the Latest Image
 
 ```bash
-docker pull ghcr.io/hydropix/translatebookwithllm:latest
+docker pull ghcr.io/hydropix/translatebookswithllms:latest
 ```
 
 ### Run the Container
@@ -19,7 +19,7 @@ docker run -d \
   -v $(pwd)/logs:/app/logs \
   -e API_ENDPOINT=http://host.docker.internal:11434/api/generate \
   -e DEFAULT_MODEL=qwen3:14b \
-  ghcr.io/hydropix/translatebookwithllm:latest
+  ghcr.io/hydropix/translatebookswithllms:latest
 ```
 
 Access the web interface at: `http://localhost:5000`
@@ -58,7 +58,7 @@ version: '3.8'
 
 services:
   translate-book:
-    image: ghcr.io/hydropix/translatebookwithllm:latest
+    image: ghcr.io/hydropix/translatebookswithllms:latest
     ports:
       - "5000:5000"
     volumes:
@@ -82,6 +82,32 @@ services:
 docker compose up -d
 ```
 
+## Using with Remote Ollama Server
+
+If your Ollama server is on a different machine in your local network:
+
+```yaml
+version: '3.8'
+
+services:
+  translate-book:
+    image: ghcr.io/hydropix/translatebookswithllms:latest
+    ports:
+      - "5000:5000"
+    environment:
+      - API_ENDPOINT=http://ollama-server.local:11434/api/generate
+      - LLM_PROVIDER=ollama
+    extra_hosts:
+      # Replace with your Ollama server's IP address
+      # Example: if your server is at 192.168.1.50
+      - "ollama-server.local:YOUR_OLLAMA_SERVER_IP"
+    volumes:
+      - ./translated_files:/app/translated_files
+      - ./logs:/app/logs
+```
+
+**Note:** Docker Desktop isolates containers from your local network. Use `extra_hosts` to map hostnames to IP addresses.
+
 ## Multi-Platform Support
 
 The images are built for multiple architectures:
@@ -102,7 +128,7 @@ Docker automatically pulls the correct architecture for your system.
 | `PORT` | Web server port | `5000` |
 | `OLLAMA_NUM_CTX` | Context window size | `2048` |
 | `REQUEST_TIMEOUT` | API timeout (seconds) | `900` |
-| `MAIN_LINES_PER_CHUNK` | Lines per translation chunk | `25` |
+| `MAX_TOKENS_PER_CHUNK` | Tokens per translation chunk | `400` |
 | `SIGNATURE_ENABLED` | Add signature to translations | `true` |
 
 ## Volume Mounts
@@ -133,7 +159,7 @@ docker run -d \
   -p 5000:5000 \
   -e API_ENDPOINT=http://host.docker.internal:11434/api/generate \
   -e DEFAULT_MODEL=qwen3:14b \
-  ghcr.io/hydropix/translatebookwithllm:latest
+  ghcr.io/hydropix/translatebookswithllms:latest
 ```
 
 **Note**: `host.docker.internal` allows the container to access services on the host.
@@ -152,7 +178,7 @@ services:
       - ollama_data:/root/.ollama
 
   translate-book:
-    image: ghcr.io/hydropix/translatebookwithllm:latest
+    image: ghcr.io/hydropix/translatebookswithllms:latest
     ports:
       - "5000:5000"
     environment:
@@ -175,7 +201,7 @@ docker run -d \
   -e LLM_PROVIDER=gemini \
   -e GEMINI_API_KEY=your_api_key_here \
   -e DEFAULT_MODEL=gemini-2.0-flash \
-  ghcr.io/hydropix/translatebookwithllm:latest
+  ghcr.io/hydropix/translatebookswithllms:latest
 ```
 
 ### OpenAI
@@ -187,7 +213,7 @@ docker run -d \
   -e OPENAI_API_KEY=your_api_key_here \
   -e API_ENDPOINT=https://api.openai.com/v1/chat/completions \
   -e DEFAULT_MODEL=gpt-4o \
-  ghcr.io/hydropix/translatebookwithllm:latest
+  ghcr.io/hydropix/translatebookswithllms:latest
 ```
 
 ## Health Check
@@ -267,13 +293,13 @@ Images are automatically built and published to GitHub Container Registry when:
 
 ```bash
 # Latest version
-docker pull ghcr.io/hydropix/translatebookwithllm:latest
+docker pull ghcr.io/hydropix/translatebookswithllms:latest
 
 # Specific version
-docker pull ghcr.io/hydropix/translatebookwithllm:v1.2.3
+docker pull ghcr.io/hydropix/translatebookswithllms:v1.2.3
 
 # Specific commit
-docker pull ghcr.io/hydropix/translatebookwithllm:main-abc1234
+docker pull ghcr.io/hydropix/translatebookswithllms:main-abc1234
 ```
 
 ## CI/CD Integration

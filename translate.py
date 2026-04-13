@@ -4,11 +4,18 @@ Command-line interface for text translation
 import os
 import argparse
 import asyncio
+import logging
 
-from src.config import DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT, LLM_PROVIDER, GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
-from src.utils.file_utils import translate_file, get_unique_output_path, generate_tts_for_translation
+# Reduce verbosity of httpx (avoid showing 400 errors during model detection)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
+from src.config import DEFAULT_MODEL, API_ENDPOINT, LLM_PROVIDER, GEMINI_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, MISTRAL_API_KEY, DEEPSEEK_API_KEY, POE_API_KEY, NIM_API_KEY, DEFAULT_SOURCE_LANGUAGE, DEFAULT_TARGET_LANGUAGE
+from src.utils.file_utils import get_unique_output_path, generate_tts_for_translation
 from src.utils.unified_logger import setup_cli_logger, LogType
 from src.tts.tts_config import TTSConfig, TTS_ENABLED, TTS_VOICE, TTS_RATE, TTS_BITRATE, TTS_OUTPUT_FORMAT
+from src.persistence.checkpoint_manager import CheckpointManager
+from src.core.adapters import translate_file
+import uuid
 
 
 if __name__ == "__main__":
@@ -18,19 +25,19 @@ if __name__ == "__main__":
     parser.add_argument("-sl", "--source_lang", default=DEFAULT_SOURCE_LANGUAGE, help=f"Source language (default: {DEFAULT_SOURCE_LANGUAGE}).")
     parser.add_argument("-tl", "--target_lang", default=DEFAULT_TARGET_LANGUAGE, help=f"Target language (default: {DEFAULT_TARGET_LANGUAGE}).")
     parser.add_argument("-m", "--model", default=DEFAULT_MODEL, help=f"LLM model (default: {DEFAULT_MODEL}).")
-    parser.add_argument("-cs", "--chunksize", type=int, default=MAIN_LINES_PER_CHUNK, help=f"Target lines per chunk (default: {MAIN_LINES_PER_CHUNK}).")
     parser.add_argument("--api_endpoint", default=API_ENDPOINT, help=f"API endpoint for Ollama or OpenAI-compatible servers (llama.cpp, LM Studio, vLLM, etc.) (default: {API_ENDPOINT}).")
-    parser.add_argument("--provider", default=LLM_PROVIDER, choices=["ollama", "gemini", "openai", "openrouter"], help=f"LLM provider (default: {LLM_PROVIDER}). Use 'openai' for any OpenAI-compatible server.")
+    parser.add_argument("--provider", default=LLM_PROVIDER, choices=["ollama", "gemini", "openai", "openrouter", "mistral", "deepseek", "poe", "nim"], help=f"LLM provider (default: {LLM_PROVIDER}). Use 'openai' for any OpenAI-compatible server.")
     parser.add_argument("--gemini_api_key", default=GEMINI_API_KEY, help="Google Gemini API key (required if using gemini provider).")
     parser.add_argument("--openai_api_key", default=OPENAI_API_KEY, help="OpenAI API key (required for OpenAI cloud, not needed for local servers).")
     parser.add_argument("--openrouter_api_key", default=OPENROUTER_API_KEY, help="OpenRouter API key (required if using openrouter provider).")
+    parser.add_argument("--mistral_api_key", default=MISTRAL_API_KEY, help="Mistral API key (required if using mistral provider).")
+    parser.add_argument("--deepseek_api_key", default=DEEPSEEK_API_KEY, help="DeepSeek API key (required if using deepseek provider).")
+    parser.add_argument("--poe_api_key", default=POE_API_KEY, help="Poe API key (required if using poe provider). Get your key at https://poe.com/api_key")
+    parser.add_argument("--nim_api_key", default=NIM_API_KEY, help="NVIDIA NIM API key (required if using nim provider). Get your key at https://build.nvidia.com/")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
-    parser.add_argument("--fast-mode", action="store_true", help="Use fast mode for EPUB (strips formatting, maximum compatibility).")
-    parser.add_argument("--no-images", action="store_true", help="Disable image preservation in fast mode (images will be stripped).")
 
     # Prompt options (optional system prompt instructions)
     prompt_group = parser.add_argument_group('Prompt Options', 'Optional instructions to include in the translation prompt')
-    prompt_group.add_argument("--preserve-technical", action="store_true", help="Preserve technical content (code, paths, URLs) without translation.")
     prompt_group.add_argument("--text-cleanup", action="store_true", help="Enable OCR/typographic cleanup (fix broken lines, spacing, punctuation).")
     prompt_group.add_argument("--refine", action="store_true", help="Enable refinement pass: runs a second pass to polish translation quality and literary style.")
 
@@ -44,6 +51,22 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Auto-select default model based on provider if not explicitly set
+    from src.config import NIM_MODEL, MISTRAL_MODEL, DEEPSEEK_MODEL, POE_MODEL, OPENROUTER_MODEL, GEMINI_MODEL
+    if args.model == DEFAULT_MODEL:
+        if args.provider == "nim" and NIM_MODEL:
+            args.model = NIM_MODEL
+        elif args.provider == "mistral" and MISTRAL_MODEL:
+            args.model = MISTRAL_MODEL
+        elif args.provider == "deepseek" and DEEPSEEK_MODEL:
+            args.model = DEEPSEEK_MODEL
+        elif args.provider == "poe" and POE_MODEL:
+            args.model = POE_MODEL
+        elif args.provider == "openrouter" and OPENROUTER_MODEL:
+            args.model = OPENROUTER_MODEL
+        elif args.provider == "gemini" and GEMINI_MODEL:
+            args.model = GEMINI_MODEL
+
     if args.output is None:
         base, ext = os.path.splitext(args.input)
         output_ext = ext
@@ -51,7 +74,8 @@ if __name__ == "__main__":
             output_ext = '.epub'
         elif args.input.lower().endswith('.srt'):
             output_ext = '.srt'
-        args.output = f"{base}_translated_{args.target_lang.lower()}{output_ext}"
+        # Use parentheses format: {originalName} ({target_lang}).{ext}
+        args.output = f"{base} ({args.target_lang}){output_ext}"
 
     # Ensure output path is unique (add number suffix if file exists)
     args.output = get_unique_output_path(args.output)
@@ -70,54 +94,18 @@ if __name__ == "__main__":
     # Validate API keys for providers
     if args.provider == "gemini" and not args.gemini_api_key:
         parser.error("--gemini_api_key is required when using gemini provider")
-    if args.provider == "openai" and not args.openai_api_key:
-        parser.error("--openai_api_key is required when using openai provider")
+    # Note: OpenAI API key is optional for local servers (llama.cpp, LM Studio, vLLM, etc.)
+    # Only required for OpenAI cloud API
     if args.provider == "openrouter" and not args.openrouter_api_key:
         parser.error("--openrouter_api_key is required when using openrouter provider")
-
-    # Check for small models (<=12B) and recommend fast mode for EPUB
-    if file_type == "EPUB" and not args.fast_mode:
-        import re
-        size_match = re.search(r'(\d+(?:\.\d+)?)b', args.model.lower())
-        if size_match:
-            size_in_b = float(size_match.group(1))
-            if size_in_b <= 12:
-                print("\n" + "="*70)
-                print("💡 RECOMMENDATION: Small model detected (≤12B parameters)")
-                print("="*70)
-                print(f"Your model '{args.model}' appears to be a small model ({size_in_b}B).")
-                print("For EPUB translation, we strongly recommend using --fast-mode")
-                print("to avoid tag management issues common with smaller models.")
-                print("\nFast mode:")
-                print("  ✅ Strips all HTML/XML formatting")
-                print("  ✅ No placeholder/tag errors")
-                print("  ✅ Maximum reliability with small models")
-                print("  ⚠️  Loses inline formatting (bold, italic, etc.)")
-                print("\nTo use fast mode, add: --fast-mode")
-                print("="*70 + "\n")
-    
-    # PHASE 2: Validation of configuration at startup
-    if args.provider == "ollama":
-        from src.core.context_optimizer import validate_configuration
-        from src.config import OLLAMA_NUM_CTX, AUTO_ADJUST_CONTEXT
-
-        warnings = validate_configuration(
-            chunk_size=args.chunksize,
-            num_ctx=OLLAMA_NUM_CTX,
-            model_name=args.model
-        )
-
-        for warning in warnings:
-            logger.warning(warning)
-
-        # Optional: Ask for confirmation if configuration is suboptimal
-        if warnings and not AUTO_ADJUST_CONTEXT:
-            print("\n⚠️  Configuration warnings detected (see above)")
-            print("Consider enabling AUTO_ADJUST_CONTEXT=true in .env file")
-            response = input("Continue anyway? (y/n): ")
-            if response.lower() != 'y':
-                print("Aborted. Please adjust configuration and try again.")
-                exit(1)
+    if args.provider == "mistral" and not args.mistral_api_key:
+        parser.error("--mistral_api_key is required when using mistral provider")
+    if args.provider == "deepseek" and not args.deepseek_api_key:
+        parser.error("--deepseek_api_key is required when using deepseek provider")
+    if args.provider == "poe" and not args.poe_api_key:
+        parser.error("--poe_api_key is required when using poe provider. Get your key at https://poe.com/api_key")
+    if args.provider == "nim" and not args.nim_api_key:
+        parser.error("--nim_api_key is required when using nim provider. Get your key at https://build.nvidia.com/")
 
     # Log translation start
     logger.info("Translation Started", LogType.TRANSLATION_START, {
@@ -127,7 +115,6 @@ if __name__ == "__main__":
         'model': args.model,
         'input_file': args.input,
         'output_file': args.output,
-        'chunk_size': args.chunksize,
         'api_endpoint': args.api_endpoint,
         'llm_provider': args.provider
     })
@@ -135,37 +122,49 @@ if __name__ == "__main__":
     # Create legacy callback for backward compatibility
     log_callback = logger.create_legacy_callback()
 
-    # Handle --no-images flag by modifying the config
-    if args.no_images:
-        import src.config as config_module
-        config_module.FAST_MODE_PRESERVE_IMAGES = False
-        logger.info("Image preservation disabled", LogType.INFO, {'preserve_images': False})
+    # Create stats callback to update logger progress
+    def stats_callback(stats: dict):
+        completed = stats.get('completed_chunks', 0)
+        total = stats.get('total_chunks', 0)
+        if total > 0:
+            logger.update_progress(completed, total)
 
     # Build prompt_options from CLI arguments
+    # Technical content protection is now always enabled
     prompt_options = {
-        'preserve_technical_content': args.preserve_technical,
+        'preserve_technical_content': True,
         'text_cleanup': args.text_cleanup,
         'refine': args.refine
     }
 
     try:
+        # Create checkpoint manager for resume capability
+        checkpoint_manager = CheckpointManager()
+
+        # Generate unique translation ID
+        translation_id = f"cli_{uuid.uuid4().hex[:8]}"
+
+        # Call the new adapter-based translate_file
         asyncio.run(translate_file(
-            args.input,
-            args.output,
-            args.source_lang,
-            args.target_lang,
-            args.model,
-            chunk_target_size_cli=args.chunksize,
-            cli_api_endpoint=args.api_endpoint,
-            progress_callback=None,
-            log_callback=log_callback,
-            stats_callback=None,
-            check_interruption_callback=None,
+            input_filepath=args.input,
+            output_filepath=args.output,
+            source_language=args.source_lang,
+            target_language=args.target_lang,
+            model_name=args.model,
             llm_provider=args.provider,
+            checkpoint_manager=checkpoint_manager,
+            translation_id=translation_id,
+            log_callback=log_callback,
+            stats_callback=stats_callback,
+            check_interruption_callback=None,
+            llm_api_endpoint=args.api_endpoint,
             gemini_api_key=args.gemini_api_key,
             openai_api_key=args.openai_api_key,
             openrouter_api_key=args.openrouter_api_key,
-            fast_mode=args.fast_mode,
+            mistral_api_key=args.mistral_api_key,
+            deepseek_api_key=args.deepseek_api_key,
+            poe_api_key=args.poe_api_key,
+            nim_api_key=args.nim_api_key,
             prompt_options=prompt_options
         ))
 

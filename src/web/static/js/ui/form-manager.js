@@ -10,18 +10,31 @@ import { ApiClient } from '../core/api-client.js';
 import { DomHelpers } from './dom-helpers.js';
 import { MessageLogger } from './message-logger.js';
 import { ApiKeyUtils } from '../utils/api-key-utils.js';
+import { TranslationTracker } from '../translation/translation-tracker.js';
+import { SettingsManager } from '../core/settings-manager.js';
 
 /**
  * Set default language in select/input
  * @param {string} selectId - Select element ID
  * @param {string} customInputId - Custom input element ID
  * @param {string} defaultLanguage - Default language value
+ * @param {boolean} [forceOverwrite=false] - If true, overwrite even if "Other" is selected with a value
  */
-function setDefaultLanguage(selectId, customInputId, defaultLanguage) {
+function setDefaultLanguage(selectId, customInputId, defaultLanguage, forceOverwrite = false) {
     const select = DomHelpers.getElement(selectId);
     const customInput = DomHelpers.getElement(customInputId);
+    const containerId = customInputId + 'Container';
+    const container = DomHelpers.getElement(containerId);
 
     if (!select || !customInput) return;
+
+    // Don't overwrite if "Other" is already selected with a custom value (restored from file)
+    // This preserves custom languages across page reloads
+    if (!forceOverwrite && select.value === 'Other' && customInput.value.trim()) {
+        // Keep the existing "Other" selection and show the container
+        if (container) container.style.display = 'block';
+        return;
+    }
 
     // Check if the default language is in the dropdown options (excluding "Other")
     let languageFound = false;
@@ -32,7 +45,7 @@ function setDefaultLanguage(selectId, customInputId, defaultLanguage) {
         if (option.value.toLowerCase() === defaultLanguage.toLowerCase()) {
             select.value = option.value;
             languageFound = true;
-            DomHelpers.hide(customInput);
+            if (container) container.style.display = 'none';
             break;
         }
     }
@@ -41,10 +54,8 @@ function setDefaultLanguage(selectId, customInputId, defaultLanguage) {
     if (!languageFound) {
         select.value = 'Other';
         customInput.value = defaultLanguage;
-        // Show the custom input - need both class removal AND style change
-        // because HTML has inline style="display: none"
-        customInput.classList.remove('hidden');
-        customInput.style.display = 'block';
+        // Show the container (not just the input)
+        if (container) container.style.display = 'block';
     }
 }
 
@@ -55,6 +66,7 @@ export const FormManager = {
     initialize() {
         this.setupEventListeners();
         this.loadDefaultConfig();
+        this.loadCustomInstructions();
     },
 
     /**
@@ -77,27 +89,48 @@ export const FormManager = {
             });
         }
 
-        // Advanced settings toggle
-        const advancedIcon = DomHelpers.getElement('advancedIcon');
-        if (advancedIcon) {
-            advancedIcon.addEventListener('click', () => {
-                this.toggleAdvanced();
-            });
-        }
-
-        // Fast mode checkbox
-        const fastMode = DomHelpers.getElement('fastMode');
-        if (fastMode) {
-            fastMode.addEventListener('change', (e) => {
-                this.handleFastModeToggle(e.target.checked);
-            });
-        }
-
         // TTS enabled checkbox
         const ttsEnabled = DomHelpers.getElement('ttsEnabled');
         if (ttsEnabled) {
             ttsEnabled.addEventListener('change', (e) => {
                 this.handleTtsToggle(e.target.checked);
+            });
+        }
+
+        // Prompt options checkboxes - keep section open if any is checked
+        const textCleanup = DomHelpers.getElement('textCleanup');
+        const refineTranslation = DomHelpers.getElement('refineTranslation');
+        const bilingualMode = DomHelpers.getElement('bilingualMode');
+        const customInstructionSelect = DomHelpers.getElement('customInstructionSelect');
+
+        [textCleanup, refineTranslation, bilingualMode].forEach(checkbox => {
+            if (checkbox) {
+                checkbox.addEventListener('change', () => {
+                    this.handlePromptOptionChange();
+                });
+            }
+        });
+
+        // Custom instruction select - keep section open if a file is selected
+        if (customInstructionSelect) {
+            customInstructionSelect.addEventListener('change', () => {
+                this.handlePromptOptionChange();
+            });
+        }
+
+        // Custom instructions refresh button
+        const refreshCustomInstructionsBtn = DomHelpers.getElement('refreshCustomInstructionsBtn');
+        if (refreshCustomInstructionsBtn) {
+            refreshCustomInstructionsBtn.addEventListener('click', () => {
+                this.loadCustomInstructions();
+            });
+        }
+
+        // Custom instructions open folder button
+        const openCustomInstructionsFolderBtn = DomHelpers.getElement('openCustomInstructionsFolderBtn');
+        if (openCustomInstructionsFolderBtn) {
+            openCustomInstructionsFolderBtn.addEventListener('click', () => {
+                this.openCustomInstructionsFolder();
             });
         }
 
@@ -108,6 +141,46 @@ export const FormManager = {
                 this.resetForm();
             });
         }
+
+        // Endpoint change listeners - detect manual modifications
+        const apiEndpoint = DomHelpers.getElement('apiEndpoint');
+        if (apiEndpoint) {
+            apiEndpoint.addEventListener('change', () => {
+                SettingsManager.markEndpointCustomized('ollama');
+                console.log('[FormManager] Ollama endpoint customized by user');
+            });
+        }
+
+        const openaiEndpoint = DomHelpers.getElement('openaiEndpoint');
+        if (openaiEndpoint) {
+            openaiEndpoint.addEventListener('change', () => {
+                SettingsManager.markEndpointCustomized('openai');
+                console.log('[FormManager] OpenAI endpoint customized by user');
+            });
+        }
+
+        // Reset endpoint to server default buttons
+        const resetApiEndpointBtn = DomHelpers.getElement('resetApiEndpointBtn');
+        if (resetApiEndpointBtn) {
+            resetApiEndpointBtn.addEventListener('click', () => {
+                const config = StateManager.getState('ui.defaultConfig');
+                const serverEndpoint = config?.ollama_api_endpoint || config?.api_endpoint;
+                if (serverEndpoint) {
+                    SettingsManager.resetEndpointToServerDefault('ollama', serverEndpoint);
+                }
+            });
+        }
+
+        const resetOpenaiEndpointBtn = DomHelpers.getElement('resetOpenaiEndpointBtn');
+        if (resetOpenaiEndpointBtn) {
+            resetOpenaiEndpointBtn.addEventListener('click', () => {
+                const config = StateManager.getState('ui.defaultConfig');
+                const serverEndpoint = config?.openai_api_endpoint;
+                if (serverEndpoint) {
+                    SettingsManager.resetEndpointToServerDefault('openai', serverEndpoint);
+                }
+            });
+        }
     },
 
     /**
@@ -115,16 +188,15 @@ export const FormManager = {
      * @param {HTMLSelectElement} selectElement - Source language select element
      */
     checkCustomSourceLanguage(selectElement) {
+        const container = DomHelpers.getElement('customSourceLangContainer');
         const customLangInput = DomHelpers.getElement('customSourceLang');
-        if (!customLangInput) return;
+        if (!container || !customLangInput) return;
 
         if (selectElement.value === 'Other') {
-            customLangInput.classList.remove('hidden');
-            customLangInput.style.display = 'block';
+            container.style.display = 'block';
             customLangInput.focus();
         } else {
-            customLangInput.classList.add('hidden');
-            customLangInput.style.display = 'none';
+            container.style.display = 'none';
         }
     },
 
@@ -133,34 +205,33 @@ export const FormManager = {
      * @param {HTMLSelectElement} selectElement - Target language select element
      */
     checkCustomTargetLanguage(selectElement) {
+        const container = DomHelpers.getElement('customTargetLangContainer');
         const customLangInput = DomHelpers.getElement('customTargetLang');
-        if (!customLangInput) return;
+        if (!container || !customLangInput) return;
 
         if (selectElement.value === 'Other') {
-            customLangInput.classList.remove('hidden');
-            customLangInput.style.display = 'block';
+            container.style.display = 'block';
             customLangInput.focus();
         } else {
-            customLangInput.classList.add('hidden');
-            customLangInput.style.display = 'none';
+            container.style.display = 'none';
         }
     },
 
 
     /**
-     * Toggle advanced settings panel
+     * Toggle settings options panel
      */
-    toggleAdvanced() {
-        const settings = DomHelpers.getElement('advancedSettings');
-        const icon = DomHelpers.getElement('advancedIcon');
+    toggleSettingsOptions() {
+        const section = DomHelpers.getElement('settingsOptionsSection');
+        const icon = DomHelpers.getElement('settingsOptionsIcon');
 
-        if (!settings || !icon) return;
+        if (!section || !icon) return;
 
-        const isHidden = settings.classList.toggle('hidden');
-        DomHelpers.setText(icon, isHidden ? '▼' : '▲');
+        const isHidden = section.classList.toggle('hidden');
+        icon.style.transform = isHidden ? 'rotate(0deg)' : 'rotate(180deg)';
 
         // Update state
-        StateManager.setState('ui.isAdvancedOpen', !isHidden);
+        StateManager.setState('ui.isSettingsOptionsOpen', !isHidden);
     },
 
     /**
@@ -180,24 +251,49 @@ export const FormManager = {
     },
 
     /**
-     * Handle fast mode toggle
-     * @param {boolean} isChecked - Whether fast mode is checked
+     * Toggle activity log panel
      */
-    handleFastModeToggle(isChecked) {
-        const fastModeInfo = DomHelpers.getElement('fastModeInfo');
+    toggleActivityLog() {
+        const section = DomHelpers.getElement('activityLogSection');
+        const icon = DomHelpers.getElement('activityLogIcon');
 
-        // Use inline style to override display:none
-        if (fastModeInfo) {
-            if (isChecked) {
-                fastModeInfo.style.display = 'block';
-            } else {
-                fastModeInfo.style.display = 'none';
+        if (!section || !icon) return;
+
+        const isHidden = section.classList.toggle('hidden');
+        icon.style.transform = isHidden ? 'rotate(0deg)' : 'rotate(180deg)';
+
+        // Update state
+        StateManager.setState('ui.isActivityLogOpen', !isHidden);
+    },
+
+    /**
+     * Handle prompt option checkbox change - keep section open if any option is active
+     */
+    handlePromptOptionChange() {
+        const textCleanup = DomHelpers.getElement('textCleanup');
+        const refineTranslation = DomHelpers.getElement('refineTranslation');
+        const bilingualMode = DomHelpers.getElement('bilingualMode');
+        const customInstructionSelect = DomHelpers.getElement('customInstructionSelect');
+
+        const anyActive = (
+            textCleanup?.checked ||
+            refineTranslation?.checked ||
+            bilingualMode?.checked ||
+            (customInstructionSelect?.value && customInstructionSelect.value !== '')
+        );
+
+        if (anyActive) {
+            const section = DomHelpers.getElement('promptOptionsSection');
+            const icon = DomHelpers.getElement('promptOptionsIcon');
+
+            if (section && section.classList.contains('hidden')) {
+                section.classList.remove('hidden');
+                if (icon) {
+                    icon.style.transform = 'rotate(180deg)';
+                }
+                StateManager.setState('ui.isPromptOptionsOpen', true);
             }
         }
-
-        // Re-check model size when fast mode changes
-        // This will be handled by model-detector.js when it's created
-        window.dispatchEvent(new CustomEvent('fastModeChanged', { detail: { enabled: isChecked } }));
     },
 
     /**
@@ -220,50 +316,227 @@ export const FormManager = {
     },
 
     /**
+     * Detect browser language and map to full language name
+     * @returns {string} Full language name (e.g., "French", "English")
+     */
+    detectBrowserLanguage() {
+        // Get browser language (e.g., "fr-FR", "en-US", "zh-CN")
+        const browserLang = navigator.language || navigator.userLanguage || 'en';
+        const langCode = browserLang.split('-')[0].toLowerCase();
+
+        // Map language codes to full names used in the UI
+        const languageMap = {
+            'en': 'English',
+            'zh': 'Chinese',
+            'es': 'Spanish',
+            'fr': 'French',
+            'de': 'German',
+            'ja': 'Japanese',
+            'ko': 'Korean',
+            'pt': 'Portuguese',
+            'ru': 'Russian',
+            'ar': 'Arabic',
+            'it': 'Italian',
+            'nl': 'Dutch',
+            'pl': 'Polish',
+            'sv': 'Swedish',
+            'no': 'Norwegian',
+            'da': 'Danish',
+            'fi': 'Finnish',
+            'el': 'Greek',
+            'hu': 'Hungarian',
+            'cs': 'Czech',
+            'sk': 'Slovak',
+            'ro': 'Romanian',
+            'bg': 'Bulgarian',
+            'hr': 'Croatian',
+            'sr': 'Serbian',
+            'uk': 'Ukrainian',
+            'ca': 'Catalan',
+            'hi': 'Hindi',
+            'bn': 'Bengali',
+            'ur': 'Urdu',
+            'pa': 'Punjabi',
+            'ta': 'Tamil',
+            'te': 'Telugu',
+            'mr': 'Marathi',
+            'gu': 'Gujarati',
+            'vi': 'Vietnamese',
+            'th': 'Thai',
+            'id': 'Indonesian',
+            'ms': 'Malay',
+            'tl': 'Tagalog',
+            'my': 'Burmese',
+            'fa': 'Persian',
+            'tr': 'Turkish',
+            'he': 'Hebrew',
+            'sw': 'Swahili',
+            'am': 'Amharic'
+        };
+
+        return languageMap[langCode] || 'English'; // Default to English if not found
+    },
+
+    /**
      * Load default configuration from server
      */
     async loadDefaultConfig() {
         try {
             const config = await ApiClient.getConfig();
 
-            // Set default languages
-            if (config.default_source_language) {
-                setDefaultLanguage('sourceLang', 'customSourceLang', config.default_source_language);
-            }
-            if (config.default_target_language) {
+            // Store config in state first so other modules can access it
+            StateManager.setState('ui.defaultConfig', config);
+
+            // Set target language from server config if available
+            // This fixes GitHub issue #108: DEFAULT_TARGET_LANGUAGE was ignored
+            // Only override if server has a default target language configured
+            if (config.default_target_language && config.default_target_language.trim()) {
+                console.log('[FormManager] Applying DEFAULT_TARGET_LANGUAGE from server:', config.default_target_language);
                 setDefaultLanguage('targetLang', 'customTargetLang', config.default_target_language);
+            } else {
+                console.log('[FormManager] No DEFAULT_TARGET_LANGUAGE from server, keeping current value');
             }
 
-            // Set other configuration values
-            if (config.api_endpoint) {
-                DomHelpers.setValue('apiEndpoint', config.api_endpoint);
+            // Set source language from server config if available
+            const sourceLanguage = config.default_source_language && config.default_source_language.trim()
+                ? config.default_source_language
+                : '';  // Empty = auto-detect from file
+            setDefaultLanguage('sourceLang', 'customSourceLang', sourceLanguage)
+
+            // Set provider-specific API endpoints with smart merge:
+            // - If user has customized endpoint, keep it and show badge
+            // - Otherwise use server default (.env)
+            // Ollama endpoint (for Ollama provider)
+            const ollamaEndpoint = config.ollama_api_endpoint || config.api_endpoint;
+            if (ollamaEndpoint) {
+                const prefs = SettingsManager.getLocalPreferences();
+                // Check if user has a customized endpoint
+                if (prefs.apiEndpointCustomized && prefs.lastApiEndpoint) {
+                    // User customized - keep their value but show badge
+                    SettingsManager.updateEndpointBadge('ollama', true);
+                    console.log('[FormManager] Using customized Ollama endpoint:', prefs.lastApiEndpoint);
+                } else {
+                    // Use server default
+                    DomHelpers.setValue('apiEndpoint', ollamaEndpoint);
+                }
             }
-            if (config.chunk_size) {
-                DomHelpers.setValue('chunkSize', config.chunk_size);
+            
+            // OpenAI endpoint (for OpenAI-compatible providers like OpenAI, LM Studio)
+            if (config.openai_api_endpoint) {
+                const prefs = SettingsManager.getLocalPreferences();
+                // Check if user has a customized endpoint
+                if (prefs.openaiEndpointCustomized && prefs.lastOpenaiEndpoint) {
+                    // User customized - keep their value but show badge
+                    SettingsManager.updateEndpointBadge('openai', true);
+                    console.log('[FormManager] Using customized OpenAI endpoint:', prefs.lastOpenaiEndpoint);
+                } else {
+                    // Use server default
+                    DomHelpers.setValue('openaiEndpoint', config.openai_api_endpoint);
+                }
             }
-            if (config.timeout) {
-                DomHelpers.setValue('timeout', config.timeout);
-            }
-            if (config.context_window) {
-                DomHelpers.setValue('contextWindow', config.context_window);
-            }
-            if (config.max_attempts) {
-                DomHelpers.setValue('maxAttempts', config.max_attempts);
-            }
-            if (config.retry_delay) {
-                DomHelpers.setValue('retryDelay', config.retry_delay);
+            
+            // Output filename pattern (naming convention)
+            if (config.output_filename_pattern) {
+                DomHelpers.setValue('outputFilenamePattern', config.output_filename_pattern);
             }
             // Handle API keys - show indicator if configured in .env, otherwise keep placeholder
             ApiKeyUtils.setupField('geminiApiKey', config.gemini_api_key_configured, config.gemini_api_key);
             ApiKeyUtils.setupField('openaiApiKey', config.openai_api_key_configured, config.openai_api_key);
             ApiKeyUtils.setupField('openrouterApiKey', config.openrouter_api_key_configured, config.openrouter_api_key);
+            ApiKeyUtils.setupField('mistralApiKey', config.mistral_api_key_configured, config.mistral_api_key);
+            ApiKeyUtils.setupField('deepseekApiKey', config.deepseek_api_key_configured, config.deepseek_api_key);
+            ApiKeyUtils.setupField('poeApiKey', config.poe_api_key_configured, config.poe_api_key);
+            ApiKeyUtils.setupField('nimApiKey', config.nim_api_key_configured, config.nim_api_key);
 
-            // Store in state
-            StateManager.setState('ui.defaultConfig', config);
+            // After loading defaults, dispatch event to notify other modules
+            console.log('[FormManager] Default config loaded, dispatching event');
+            window.dispatchEvent(new CustomEvent('defaultConfigLoaded'));
 
         } catch (error) {
-            console.error('Error loading default configuration:', error);
+            console.error('[FormManager] Failed to load default configuration:', error);
             MessageLogger.showMessage('Failed to load default configuration', 'warning');
+            // Still dispatch event even on error so other modules aren't blocked
+            console.log('[FormManager] Dispatching defaultConfigLoaded event despite error');
+            window.dispatchEvent(new CustomEvent('defaultConfigLoaded'));
+        }
+    },
+
+    /**
+     * Load available custom instruction files
+     */
+    async loadCustomInstructions() {
+        try {
+            console.log('[CustomInstructions] Loading custom instructions...');
+            const data = await ApiClient.getCustomInstructions();
+            console.log('[CustomInstructions] Data received:', data);
+
+            const select = DomHelpers.getElement('customInstructionSelect');
+            if (!select) {
+                console.warn('[CustomInstructions] Select element not found!');
+                return;
+            }
+
+            // Save current value before resetting dropdown
+            const currentValue = select.value;
+
+            // Reset dropdown to default
+            select.innerHTML = '<option value="">None</option>';
+
+            // Populate dropdown with available files
+            if (data.files && data.files.length > 0) {
+                console.log('[CustomInstructions] Adding', data.files.length, 'files to dropdown');
+                data.files.forEach(file => {
+                    const option = document.createElement('option');
+                    option.value = file.filename;
+                    option.textContent = file.display_name;
+                    select.appendChild(option);
+                    console.log('[CustomInstructions] Added option:', file.display_name);
+                });
+            } else {
+                console.warn('[CustomInstructions] No files found in response');
+            }
+
+            // Restore previously selected value if it still exists in the list
+            if (currentValue) {
+                // Check if the value exists in options
+                let found = false;
+                for (let option of select.options) {
+                    if (option.value === currentValue) {
+                        select.value = currentValue;
+                        found = true;
+                        console.log('[CustomInstructions] Restored selection:', currentValue);
+                        break;
+                    }
+                }
+                if (!found) {
+                    console.warn('[CustomInstructions] Previously selected file not found:', currentValue);
+                }
+            }
+
+            // Dispatch event to notify that custom instructions are loaded
+            // This allows SettingsManager to restore the saved value
+            window.dispatchEvent(new CustomEvent('customInstructionsLoaded'));
+        } catch (error) {
+            console.error('[CustomInstructions] Error loading custom instructions:', error);
+            // Graceful degradation - dropdown will only show "None" option
+            // Still dispatch event even on error
+            window.dispatchEvent(new CustomEvent('customInstructionsLoaded'));
+        }
+    },
+
+    /**
+     * Open the Custom_Instructions folder in the system file explorer
+     */
+    async openCustomInstructionsFolder() {
+        try {
+            const response = await ApiClient.openCustomInstructionsFolder();
+            if (!response.success) {
+                console.error('[CustomInstructions] Failed to open folder:', response.error);
+                MessageLogger.addLog('Failed to open Custom_Instructions folder');
+            }
+        } catch (error) {
+            console.error('[CustomInstructions] Error opening folder:', error);
+            MessageLogger.addLog('Failed to open Custom_Instructions folder');
         }
     },
 
@@ -281,8 +554,8 @@ export const FormManager = {
             MessageLogger.addLog("🛑 Interrupting current translation before clearing files...");
             try {
                 await ApiClient.interruptTranslation(currentJob.translationId);
-            } catch (error) {
-                console.error('Error interrupting translation:', error);
+            } catch {
+                // Interrupt failed
             }
         }
 
@@ -295,6 +568,11 @@ export const FormManager = {
         StateManager.setState('files.toProcess', []);
         StateManager.setState('translation.currentJob', null);
         StateManager.setState('translation.isBatchActive', false);
+
+        // Clear saved translation state from localStorage
+        if (TranslationTracker && TranslationTracker.clearTranslationState) {
+            TranslationTracker.clearTranslationState();
+        }
 
         // Reset file input
         DomHelpers.setValue('fileInput', '');
@@ -309,8 +587,10 @@ export const FormManager = {
         DomHelpers.setDisabled('interruptBtn', false);
 
         // Reset language selectors
-        DomHelpers.hide('customSourceLang');
-        DomHelpers.hide('customTargetLang');
+        const sourceContainer = DomHelpers.getElement('customSourceLangContainer');
+        const targetContainer = DomHelpers.getElement('customTargetLangContainer');
+        if (sourceContainer) sourceContainer.style.display = 'none';
+        if (targetContainer) targetContainer.style.display = 'none';
         DomHelpers.getElement('sourceLang').selectedIndex = 0;
         DomHelpers.getElement('targetLang').selectedIndex = 0;
 
@@ -329,8 +609,7 @@ export const FormManager = {
                 if (result.failed && result.failed.length > 0) {
                     MessageLogger.addLog(`⚠️ Failed to delete ${result.failed.length} file(s).`);
                 }
-            } catch (error) {
-                console.error('Error deleting uploaded files:', error);
+            } catch {
                 MessageLogger.addLog("⚠️ Error occurred while deleting uploaded files.");
             }
         }
@@ -399,18 +678,16 @@ export const FormManager = {
             gemini_api_key: geminiApiKey,
             openai_api_key: openaiApiKey,
             openrouter_api_key: openrouterApiKey,
-            chunk_size: parseInt(DomHelpers.getValue('chunkSize')),
-            timeout: parseInt(DomHelpers.getValue('timeout')),
-            context_window: parseInt(DomHelpers.getValue('contextWindow')),
-            max_attempts: parseInt(DomHelpers.getValue('maxAttempts')),
-            retry_delay: parseInt(DomHelpers.getValue('retryDelay')),
-            fast_mode: DomHelpers.getElement('fastMode')?.checked || false,
             // Prompt options (optional system prompt instructions)
+            // Technical content protection is always enabled
             prompt_options: {
-                preserve_technical_content: DomHelpers.getElement('preserveTechnicalContent')?.checked || false,
+                preserve_technical_content: true,
                 text_cleanup: DomHelpers.getElement('textCleanup')?.checked || false,
-                refine: DomHelpers.getElement('refineTranslation')?.checked || false
+                refine: DomHelpers.getElement('refineTranslation')?.checked || false,
+                custom_instruction_file: DomHelpers.getValue('customInstructionSelect') || ''
             },
+            // Bilingual output (original + translation interleaved)
+            bilingual_output: DomHelpers.getElement('bilingualMode')?.checked || false,
             // TTS configuration
             tts_enabled: ttsEnabled,
             tts_voice: ttsEnabled ? (DomHelpers.getValue('ttsVoice') || '') : '',

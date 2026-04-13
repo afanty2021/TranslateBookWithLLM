@@ -1,10 +1,9 @@
 """
 LLM-based translation quality evaluator.
 
-Uses OpenRouter to evaluate translations with models like:
-- anthropic/claude-3.5-sonnet
-- openai/gpt-4o
-- google/gemini-pro-1.5
+Supports multiple providers:
+- OpenRouter (google/gemini-3-flash-preview, anthropic/claude-3.5-sonnet, etc.)
+- Poe API (claude-3.5-sonnet, gpt-4o, etc.)
 """
 
 import asyncio
@@ -21,7 +20,7 @@ from benchmark.models import EvaluationScores, ReferenceText
 
 class TranslationEvaluator:
     """
-    Evaluates translation quality using LLMs via OpenRouter.
+    Evaluates translation quality using LLMs via OpenRouter or Poe.
 
     Criteria:
     - Accuracy (1-10): Preservation of meaning
@@ -33,17 +32,20 @@ class TranslationEvaluator:
     def __init__(
         self,
         config: BenchmarkConfig,
-        log_callback: Optional[Callable[[str, str], None]] = None
+        log_callback: Optional[Callable[[str, str], None]] = None,
+        provider: Optional[str] = None
     ):
         """
         Initialize the evaluator.
 
         Args:
-            config: Benchmark configuration with OpenRouter settings
+            config: Benchmark configuration
             log_callback: Optional callback for logging (level, message)
+            provider: Provider to use ("openrouter" or "poe", defaults to config.evaluator_provider)
         """
         self.config = config
         self.log_callback = log_callback
+        self.provider = provider or config.evaluator_provider
         self._client: Optional[httpx.AsyncClient] = None
 
         # Cost tracking
@@ -195,6 +197,47 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
             self._log("error", f"Evaluation parsing error: {e}")
             return None
 
+    def _get_provider_config(self) -> tuple[str, str, Optional[str]]:
+        """
+        Get the provider configuration.
+        
+        Returns:
+            Tuple of (endpoint, api_key, model)
+        """
+        if self.provider == "poe":
+            return (
+                self.config.poe.endpoint,
+                self.config.poe.api_key,
+                self.config.poe.default_model
+            )
+        else:  # openrouter
+            return (
+                self.config.openrouter.endpoint,
+                self.config.openrouter.api_key,
+                self.config.openrouter.default_model
+            )
+
+    def _build_headers(self, api_key: str) -> dict:
+        """
+        Build request headers based on provider.
+        
+        Args:
+            api_key: The API key
+            
+        Returns:
+            Headers dict
+        """
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        
+        if self.provider == "openrouter":
+            headers["HTTP-Referer"] = self.config.openrouter.site_url
+            headers["X-Title"] = self.config.openrouter.site_name
+            
+        return headers
+
     async def evaluate(
         self,
         source_text: ReferenceText,
@@ -214,8 +257,12 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
         Returns:
             Tuple of (EvaluationScores, evaluation_time_ms)
         """
-        if not self.config.openrouter.api_key:
-            return EvaluationScores.failed("OpenRouter API key not configured"), 0
+        endpoint, api_key, model = self._get_provider_config()
+        
+        provider_name = self.provider.capitalize()
+        
+        if not api_key:
+            return EvaluationScores.failed(f"{provider_name} API key not configured"), 0
 
         if not translated_text or not translated_text.strip():
             return EvaluationScores.failed("Empty translation"), 0
@@ -235,15 +282,10 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
                 text_author=source_text.author
             )
 
-            headers = {
-                "Authorization": f"Bearer {self.config.openrouter.api_key}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": self.config.openrouter.site_url,
-                "X-Title": self.config.openrouter.site_name,
-            }
+            headers = self._build_headers(api_key)
 
             payload = {
-                "model": self.config.openrouter.default_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
@@ -253,7 +295,7 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
             }
 
             response = await client.post(
-                self.config.openrouter.endpoint,
+                endpoint,
                 headers=headers,
                 json=payload
             )
@@ -262,16 +304,15 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
             result = response.json()
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
 
-            # Track cost
+            # Track cost (if available)
             if "usage" in result:
                 usage = result["usage"]
-                # Estimate cost (rough approximation)
                 prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
-                # Use OpenRouter's cost if available
+                # Try to get cost from result, otherwise estimate
                 cost = float(result.get("cost", 0))
-                if cost == 0:
-                    # Fallback estimate
+                if cost == 0 and self.provider == "openrouter":
+                    # Fallback estimate for OpenRouter
                     cost = (prompt_tokens * 0.50 / 1_000_000) + (completion_tokens * 1.50 / 1_000_000)
                 self.total_cost += cost
                 self.total_evaluations += 1
@@ -279,12 +320,12 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
 
             # Extract response content
             if "choices" not in result or len(result["choices"]) == 0:
-                return EvaluationScores.failed("No response from OpenRouter"), elapsed_ms
+                return EvaluationScores.failed(f"No response from {provider_name}"), elapsed_ms
 
             response_text = result["choices"][0].get("message", {}).get("content", "")
 
             if not response_text:
-                return EvaluationScores.failed("Empty response from OpenRouter"), elapsed_ms
+                return EvaluationScores.failed(f"Empty response from {provider_name}"), elapsed_ms
 
             # Parse the evaluation
             scores = self._parse_evaluation_response(response_text)
@@ -296,21 +337,21 @@ Evaluate this translation. Respond with ONLY the JSON object:"""
 
         except httpx.HTTPStatusError as e:
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-            error_msg = f"OpenRouter HTTP error: {e.response.status_code}"
+            error_msg = f"{provider_name} HTTP error: {e.response.status_code}"
 
             if e.response.status_code == 401:
-                error_msg = "Invalid OpenRouter API key"
+                error_msg = f"Invalid {provider_name} API key"
             elif e.response.status_code == 402:
-                error_msg = "Insufficient OpenRouter credits"
+                error_msg = f"Insufficient {provider_name} credits"
             elif e.response.status_code == 404:
-                error_msg = f"Model not found: {self.config.openrouter.default_model}"
+                error_msg = f"Model not found: {model}"
 
             self._log("error", error_msg)
             return EvaluationScores.failed(error_msg), elapsed_ms
 
         except httpx.TimeoutException:
             elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-            self._log("error", "OpenRouter request timed out")
+            self._log("error", f"{provider_name} request timed out")
             return EvaluationScores.failed("Evaluation request timed out"), elapsed_ms
 
         except Exception as e:
@@ -423,6 +464,59 @@ async def test_openrouter_connection(config: BenchmarkConfig) -> tuple[bool, str
         return False, "Cannot connect to OpenRouter API"
     except Exception as e:
         return False, f"OpenRouter connection test failed: {e}"
+
+
+async def test_poe_connection(config: BenchmarkConfig) -> tuple[bool, str]:
+    """
+    Test if Poe API is accessible and the API key is valid.
+
+    Args:
+        config: Benchmark configuration
+
+    Returns:
+        Tuple of (success, message)
+    """
+    if not config.poe.api_key:
+        return False, "Poe API key not configured. Set POE_API_KEY in .env file."
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Poe API requires a POST request to test properly
+            headers = {
+                "Authorization": f"Bearer {config.poe.api_key}",
+                "Content-Type": "application/json",
+            }
+
+            # Try a minimal request to test the API key
+            payload = {
+                "model": config.poe.default_model,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 5,
+            }
+
+            response = await client.post(
+                config.poe.endpoint,
+                headers=headers,
+                json=payload
+            )
+
+            if response.status_code == 200:
+                return True, f"Poe connected. Evaluator model: {config.poe.default_model}"
+            elif response.status_code == 401:
+                return False, "Invalid Poe API key. Get your key at https://poe.com/api_key"
+            elif response.status_code == 403:
+                return False, "Poe API access denied (403). Your API key may be invalid or expired."
+            elif response.status_code == 429:
+                return False, "Poe API rate limit exceeded. Please wait before retrying."
+            else:
+                return False, f"Poe API error: HTTP {response.status_code}"
+
+    except httpx.ConnectError:
+        return False, "Cannot connect to Poe API. Check your internet connection."
+    except httpx.TimeoutException:
+        return False, "Poe API connection timed out."
+    except Exception as e:
+        return False, f"Poe connection test failed: {e}"
 
 
 async def get_recommended_evaluator_models() -> list[dict]:

@@ -13,7 +13,6 @@ from .constants import (
     TAG0,
     TAG1,
     TAG2,
-    IMG_MARKER,
 )
 
 # Re-export example dictionaries
@@ -27,7 +26,6 @@ from .helpers import (
     get_subtitle_example,
     get_output_format_example,
     build_placeholder_section,
-    build_image_placeholder_section,
     has_example_for_pair,
     ensure_example_ready,
 )
@@ -37,7 +35,6 @@ __all__ = [
     "TAG0",
     "TAG1",
     "TAG2",
-    "IMG_MARKER",
     # Technical example dictionaries (fallback)
     "PLACEHOLDER_EXAMPLES",
     "SUBTITLE_EXAMPLES",
@@ -47,7 +44,6 @@ __all__ = [
     "get_subtitle_example",
     "get_output_format_example",
     "build_placeholder_section",
-    "build_image_placeholder_section",
     "has_example_for_pair",
     "ensure_example_ready",
 ]

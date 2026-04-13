@@ -13,7 +13,11 @@ import { DomHelpers } from '../ui/dom-helpers.js';
 const STATUS_ID_MAP = {
     'geminiApiKey': 'geminiKeyStatus',
     'openaiApiKey': 'openaiKeyStatus',
-    'openrouterApiKey': 'openrouterKeyStatus'
+    'openrouterApiKey': 'openrouterKeyStatus',
+    'mistralApiKey': 'mistralKeyStatus',
+    'deepseekApiKey': 'deepseekKeyStatus',
+    'poeApiKey': 'poeKeyStatus',
+    'nimApiKey': 'nimKeyStatus'
 };
 
 /**
@@ -22,7 +26,11 @@ const STATUS_ID_MAP = {
 const PROVIDER_FIELD_MAP = {
     'gemini': 'geminiApiKey',
     'openai': 'openaiApiKey',
-    'openrouter': 'openrouterApiKey'
+    'openrouter': 'openrouterApiKey',
+    'mistral': 'mistralApiKey',
+    'deepseek': 'deepseekApiKey',
+    'poe': 'poeApiKey',
+    'nim': 'nimApiKey'
 };
 
 export const ApiKeyUtils = {
@@ -176,6 +184,22 @@ export const ApiKeyUtils = {
 
         if (provider === 'openrouter' && !isAvailable) {
             return { valid: false, message: 'OpenRouter API key is required when using OpenRouter provider.' };
+        }
+
+        if (provider === 'mistral' && !isAvailable) {
+            return { valid: false, message: 'Mistral API key is required when using Mistral provider.' };
+        }
+
+        if (provider === 'deepseek' && !isAvailable) {
+            return { valid: false, message: 'DeepSeek API key is required when using DeepSeek provider.' };
+        }
+
+        if (provider === 'poe' && !isAvailable) {
+            return { valid: false, message: 'Poe API key is required. Get your key at poe.com/api_key' };
+        }
+
+        if (provider === 'nim' && !isAvailable) {
+            return { valid: false, message: 'NVIDIA NIM API key is required when using NIM provider.' };
         }
 
         return { valid: true, message: '' };

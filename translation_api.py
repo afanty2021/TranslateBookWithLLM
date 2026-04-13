@@ -21,6 +21,9 @@ logger = logging.getLogger(__name__)
 # Reduce verbosity of werkzeug (Flask HTTP server logs)
 logging.getLogger('werkzeug').setLevel(logging.WARNING)
 
+# Reduce verbosity of httpx (avoid showing 400 errors during model detection)
+logging.getLogger('httpx').setLevel(logging.WARNING)
+
 # Fix Windows console encoding for emojis
 if sys.platform == 'win32':
     import codecs
@@ -41,16 +44,41 @@ from src.api.translation_state import get_state_manager
 
 
 # Initialize Flask app with static folder configuration
-base_path = os.getcwd()
-static_folder_path = os.path.join(base_path, 'src', 'web', 'static')
+# Handle PyInstaller bundle paths
+if getattr(sys, 'frozen', False):
+    # Running as compiled executable - files are in _MEIPASS
+    bundle_dir = sys._MEIPASS
+    static_folder_path = os.path.join(bundle_dir, 'src', 'web', 'static')
+    template_folder_path = os.path.join(bundle_dir, 'src', 'web', 'templates')
+
+    # Debug: print paths to verify
+    print(f"🔍 PyInstaller bundle detected")
+    print(f"   Bundle dir: {bundle_dir}")
+    print(f"   Static folder: {static_folder_path}")
+    print(f"   Template folder: {template_folder_path}")
+    print(f"   Static folder exists: {os.path.exists(static_folder_path)}")
+    print(f"   Template folder exists: {os.path.exists(template_folder_path)}")
+
+    if os.path.exists(template_folder_path):
+        print(f"   Templates: {os.listdir(template_folder_path)}")
+    if os.path.exists(bundle_dir):
+        print(f"   Bundle contents: {os.listdir(bundle_dir)}")
+else:
+    # Running as normal Python script
+    base_path = os.getcwd()
+    static_folder_path = os.path.join(base_path, 'src', 'web', 'static')
+    template_folder_path = os.path.join(base_path, 'src', 'web', 'templates')
+
 app = Flask(__name__,
             static_folder=static_folder_path,
+            template_folder=template_folder_path,
             static_url_path='/static')
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-# Thread-safe state manager
+# Thread-safe state manager (generates unique session ID for this server instance)
 state_manager = get_state_manager()
+logger.info(f"🔑 Server session ID: {state_manager.server_session_id}")
 
 def validate_configuration():
     """Validate required configuration before starting server"""
@@ -104,6 +132,22 @@ configure_websocket_handlers(socketio, state_manager)
 def restore_incomplete_jobs():
     """Restore incomplete translation jobs from checkpoints on server startup"""
     try:
+        # First, clean up old jobs (older than 30 days) to prevent database bloat
+        jobs_deleted, files_cleaned = state_manager.checkpoint_manager.cleanup_old_jobs(max_age_days=30)
+        if jobs_deleted > 0:
+            logger.info(f"🧹 Cleaned up {jobs_deleted} old job(s) and {files_cleaned} upload folder(s)")
+
+        # Clean up orphan upload folders (folders without corresponding jobs in DB)
+        orphans_deleted = state_manager.checkpoint_manager.cleanup_orphan_uploads()
+        if orphans_deleted > 0:
+            logger.info(f"🧹 Cleaned up {orphans_deleted} orphan upload folder(s)")
+
+        # Then, reset any jobs that were 'running' when the server was stopped
+        # These jobs are now interrupted and should be resumable
+        reset_count = state_manager.checkpoint_manager.reset_running_jobs_on_startup()
+        if reset_count > 0:
+            logger.info(f"🔄 Reset {reset_count} job(s) that were running when the server was stopped")
+
         resumable_jobs = state_manager.get_resumable_jobs()
         if resumable_jobs:
             logger.info(f"📦 Found {len(resumable_jobs)} incomplete translation job(s) from previous session:")
@@ -132,7 +176,6 @@ def open_browser(host, port):
         import time
         time.sleep(1.5)
         url = f"http://{'localhost' if host == '0.0.0.0' else host}:{port}"
-        logger.info(f"🌐 Opening browser at {url}")
         webbrowser.open(url)
 
     # Run in background thread to not block server startup
@@ -151,7 +194,11 @@ def test_ollama_connection():
         if response.status_code == 200:
             data = response.json()
             models = [m.get('name') for m in data.get('models', [])]
-            logger.info(f"✅ Ollama connected! Found {len(models)} model(s): {models}")
+            logger.info(f"✅ Ollama connected! Found {len(models)} model(s)")
+            if models:
+                logger.info(f"   Available models:")
+                for model in sorted(models):
+                    logger.info(f"     - {model}")
             return True
         else:
             logger.warning(f"⚠️ Ollama returned status {response.status_code}")
@@ -165,35 +212,55 @@ def test_ollama_connection():
         return False
 
 
-if __name__ == '__main__':
-    # Validate configuration before starting
-    validate_configuration()
+def start_server():
+    """Start the translation server - can be called from launcher or directly"""
+    try:
+        # Validate configuration before starting
+        validate_configuration()
 
-    logger.info("="*60)
-    logger.info(f"🚀 LLM TRANSLATION SERVER (Version {datetime.now().strftime('%Y%m%d-%H%M')})")
-    logger.info("="*60)
-    logger.info(f"   - Default Ollama Endpoint: {DEFAULT_OLLAMA_API_ENDPOINT}")
-    logger.info(f"   - Interface: http://{HOST}:{PORT}")
-    logger.info(f"   - API: http://{HOST}:{PORT}/api/")
-    logger.info(f"   - Health Check: http://{HOST}:{PORT}/api/health")
-    logger.info(f"   - Supported formats: .txt, .epub, and .srt")
-    logger.info("")
-
-    # Test Ollama connection at startup
-    test_ollama_connection()
-
-    logger.info("")
-    logger.info("💡 Press Ctrl+C to stop the server")
-    logger.info("")
-
-    # Production deployment note
-    if HOST == '0.0.0.0':
-        logger.warning("⚠️  Server is binding to 0.0.0.0 (all network interfaces)")
-        logger.warning("   For production, use a proper WSGI server like gunicorn:")
-        logger.warning("   gunicorn --worker-class eventlet -w 1 --bind 0.0.0.0:5000 translation_api:app")
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info("  TranslateBook with LLMs - Server")
+        logger.info("=" * 50)
+        logger.info("")
+        logger.info(f"  Ollama Endpoint: {DEFAULT_OLLAMA_API_ENDPOINT}")
+        logger.info(f"  Supported formats: .txt, .epub, .srt")
         logger.info("")
 
-    # Auto-open browser (especially useful for portable executable)
-    open_browser(HOST, PORT)
+        # Test Ollama connection at startup
+        test_ollama_connection()
 
-    socketio.run(app, debug=False, host=HOST, port=PORT, allow_unsafe_werkzeug=True)
+        logger.info("")
+        logger.info("=" * 50)
+        logger.info(f"  🌐 Web Interface: http://127.0.0.1:{PORT}")
+        logger.info("=" * 50)
+        logger.info("")
+        logger.info("  Press Ctrl+C to stop the server")
+        logger.info("")
+
+        # Production deployment note (silent for normal use)
+        if HOST == '0.0.0.0' and os.environ.get('SHOW_PRODUCTION_WARNING'):
+            logger.warning("⚠️  Server is binding to 0.0.0.0 (all network interfaces)")
+            logger.warning("   For production, use a proper WSGI server like gunicorn")
+            logger.info("")
+
+        # Auto-open browser (especially useful for portable executable)
+        open_browser(HOST, PORT)
+
+        socketio.run(app, debug=False, host=HOST, port=PORT, allow_unsafe_werkzeug=True)
+    except Exception as e:
+        logger.error("="*60)
+        logger.error("❌ FATAL ERROR")
+        logger.error("="*60)
+        logger.error(f"{e}")
+        logger.error("")
+        logger.error("Press any key to exit...")
+        logger.error("="*60)
+        import traceback
+        traceback.print_exc()
+        input()  # Keep console open
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    start_server()

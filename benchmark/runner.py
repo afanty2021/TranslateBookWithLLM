@@ -3,7 +3,7 @@ Benchmark orchestrator.
 
 Coordinates the complete benchmark workflow:
 1. Load languages and reference texts
-2. Run translations with specified Ollama models
+2. Run translations with specified provider models
 3. Evaluate translations with OpenRouter
 4. Track progress and handle resumption
 5. Generate results
@@ -25,10 +25,11 @@ from benchmark.models import (
 from benchmark.translator import (
     BenchmarkTranslator, TranslationRequest,
     test_ollama_connection, get_available_ollama_models,
+    test_openai_translation_connection, get_available_openai_models,
     test_openrouter_translation_connection, get_available_openrouter_models
 )
 from benchmark.evaluator import (
-    TranslationEvaluator, test_openrouter_connection
+    TranslationEvaluator, test_openrouter_connection, test_poe_connection
 )
 
 
@@ -206,6 +207,12 @@ class BenchmarkRunner:
                 errors.append(f"OpenRouter (translation): {or_trans_msg}")
             else:
                 self._log("info", f"OpenRouter (translation): {or_trans_msg}")
+        elif self.config.translation_provider == "openai":
+            openai_ok, openai_msg = await test_openai_translation_connection(self.config)
+            if not openai_ok:
+                errors.append(f"OpenAI-compatible (translation): {openai_msg}")
+            else:
+                self._log("info", f"OpenAI-compatible (translation): {openai_msg}")
         else:
             # Test Ollama connection
             ollama_ok, ollama_msg = await test_ollama_connection(self.config)
@@ -214,12 +221,19 @@ class BenchmarkRunner:
             else:
                 self._log("info", f"Ollama: {ollama_msg}")
 
-        # Test OpenRouter connection (for evaluation - always required)
-        openrouter_ok, openrouter_msg = await test_openrouter_connection(self.config)
-        if not openrouter_ok:
-            errors.append(f"OpenRouter (evaluation): {openrouter_msg}")
+        # Test evaluator provider connection
+        if self.config.evaluator_provider == "poe":
+            poe_ok, poe_msg = await test_poe_connection(self.config)
+            if not poe_ok:
+                errors.append(f"Poe (evaluation): {poe_msg}")
+            else:
+                self._log("info", f"Poe (evaluation): {poe_msg}")
         else:
-            self._log("info", f"OpenRouter (evaluation): {openrouter_msg}")
+            openrouter_ok, openrouter_msg = await test_openrouter_connection(self.config)
+            if not openrouter_ok:
+                errors.append(f"OpenRouter (evaluation): {openrouter_msg}")
+            else:
+                self._log("info", f"OpenRouter (evaluation): {openrouter_msg}")
 
         return len(errors) == 0, errors
 
@@ -234,7 +248,7 @@ class BenchmarkRunner:
         Generate translation jobs, skipping already completed ones.
 
         Args:
-            models: List of Ollama model names
+            models: List of provider model names
             languages: List of target languages
             texts: List of reference texts
             existing_results: Results from a previous run (for resumption)
@@ -273,7 +287,7 @@ class BenchmarkRunner:
         Execute a complete benchmark run.
 
         Args:
-            models: List of Ollama model names to benchmark
+            models: List of provider model names to benchmark
             language_codes: Language codes to test (None = quick test set)
             resume_run: Optional previous run to resume
 
@@ -298,6 +312,12 @@ class BenchmarkRunner:
         if not models:
             raise ValueError("No models specified")
 
+        # Determine evaluator model based on provider
+        if self.config.evaluator_provider == "poe":
+            evaluator_model = self.config.poe.default_model
+        else:
+            evaluator_model = self.config.openrouter.default_model
+
         # Create or resume run
         if resume_run:
             run = resume_run
@@ -309,7 +329,7 @@ class BenchmarkRunner:
                 started_at=datetime.now().isoformat(),
                 models=models,
                 languages=language_codes,
-                evaluator_model=self.config.openrouter.default_model,
+                evaluator_model=evaluator_model,
             )
             self._log("info", f"Starting new run {run.run_id}")
 
@@ -325,7 +345,11 @@ class BenchmarkRunner:
             self.log_callback,
             provider_type=self.config.translation_provider
         )
-        self._evaluator = TranslationEvaluator(self.config, self.log_callback)
+        self._evaluator = TranslationEvaluator(
+            self.config, 
+            self.log_callback,
+            provider=self.config.evaluator_provider
+        )
 
         try:
             # Generate jobs
@@ -415,7 +439,7 @@ async def quick_benchmark(
 
     Args:
         config: Benchmark configuration
-        models: Optional list of models (defaults to available Ollama models)
+        models: Optional list of models (defaults to auto-detected provider models)
         log_callback: Optional logging callback
 
     Returns:
@@ -430,9 +454,16 @@ async def quick_benchmark(
 
     # Get models if not specified
     if models is None:
-        models = await get_available_ollama_models(config)
+        if config.translation_provider == "openrouter":
+            provider_models = await get_available_openrouter_models(config)
+            models = [m["id"] if isinstance(m, dict) else m for m in provider_models]
+        elif config.translation_provider == "openai":
+            provider_models = await get_available_openai_models(config)
+            models = [m["id"] if isinstance(m, dict) else m for m in provider_models]
+        else:
+            models = await get_available_ollama_models(config)
         if not models:
-            raise RuntimeError("No Ollama models available")
+            raise RuntimeError(f"No {config.translation_provider} models available")
         # Limit to first 3 models for quick benchmark
         models = models[:3]
 
@@ -449,7 +480,7 @@ async def full_benchmark(
 
     Args:
         config: Benchmark configuration
-        models: List of Ollama models to benchmark
+        models: List of provider models to benchmark
         log_callback: Optional logging callback
 
     Returns:

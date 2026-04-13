@@ -8,6 +8,7 @@ import json
 from datetime import datetime
 from typing import Optional, Dict, Any, Callable
 from enum import Enum
+from src.utils.telemetry import get_telemetry
 
 
 class LogLevel(Enum):
@@ -43,12 +44,13 @@ class Colors:
     GRAY = '' if NO_COLOR else '\033[90m'         # Pour les infos techniques
     ORANGE = '' if NO_COLOR else '\033[38;5;214m' # Orange clair - INPUT vers LLM
     GREEN = '' if NO_COLOR else '\033[92m'        # Vert clair - OUTPUT du LLM
+    RED = '' if NO_COLOR else '\033[91m'          # Rouge - ERREURS
     ENDC = '' if NO_COLOR else '\033[0m'          # Reset
 
     @classmethod
     def disable(cls):
         """Disable all colors"""
-        cls.YELLOW = cls.WHITE = cls.GRAY = cls.ORANGE = cls.GREEN = cls.ENDC = ''
+        cls.YELLOW = cls.WHITE = cls.GRAY = cls.ORANGE = cls.GREEN = cls.RED = cls.ENDC = ''
 
 
 class UnifiedLogger:
@@ -116,8 +118,8 @@ class UnifiedLogger:
             LogLevel.DEBUG: Colors.GRAY,
             LogLevel.INFO: Colors.WHITE,
             LogLevel.WARNING: Colors.YELLOW,
-            LogLevel.ERROR: Colors.WHITE,
-            LogLevel.CRITICAL: Colors.WHITE
+            LogLevel.ERROR: Colors.RED,
+            LogLevel.CRITICAL: Colors.RED
         }
         
         color = level_colors.get(level, Colors.WHITE)
@@ -162,32 +164,37 @@ class UnifiedLogger:
         if 'model' in data:
             output.append(f"{Colors.GRAY}Model: {data['model']}{Colors.ENDC}")
         
-        # Full prompt - handle both legacy 'prompt' and new 'system_prompt'/'user_prompt' formats
-        output.append(f"\n{Colors.ORANGE}RAW PROMPT (INPUT):{Colors.ENDC}")
-        if 'system_prompt' in data or 'user_prompt' in data:
-            if data.get('system_prompt'):
-                output.append(f"{Colors.GRAY}[SYSTEM]{Colors.ENDC}")
-                output.append(f"{Colors.ORANGE}{data.get('system_prompt', '')}{Colors.ENDC}")
-            if data.get('user_prompt'):
-                output.append(f"{Colors.GRAY}[USER]{Colors.ENDC}")
-                output.append(f"{Colors.ORANGE}{data.get('user_prompt', '')}{Colors.ENDC}")
-        else:
-            output.append(f"{Colors.ORANGE}{data.get('prompt', '')}{Colors.ENDC}")
+        # Full prompt only in debug mode for console
+        # (UI always receives the full data via web_callback)
+        if self.min_level == LogLevel.DEBUG:
+            output.append(f"\n{Colors.ORANGE}RAW PROMPT (INPUT):{Colors.ENDC}")
+            if 'system_prompt' in data or 'user_prompt' in data:
+                if data.get('system_prompt'):
+                    output.append(f"{Colors.GRAY}[SYSTEM]{Colors.ENDC}")
+                    output.append(f"{Colors.ORANGE}{data.get('system_prompt', '')}{Colors.ENDC}")
+                if data.get('user_prompt'):
+                    output.append(f"{Colors.GRAY}[USER]{Colors.ENDC}")
+                    output.append(f"{Colors.ORANGE}{data.get('user_prompt', '')}{Colors.ENDC}")
+            else:
+                output.append(f"{Colors.ORANGE}{data.get('prompt', '')}{Colors.ENDC}")
 
         return '\n'.join(output)
     
     def _format_llm_response(self, data: Dict[str, Any]) -> str:
         """Format LLM response with full details"""
-        output = []
+        # In non-debug mode, return empty string (no output)
+        # Token usage is already logged separately
+        if self.min_level != LogLevel.DEBUG:
+            return ""
 
+        # Debug mode: show full details
+        output = []
         timestamp = self._format_timestamp()
         output.append(f"{Colors.GREEN}[{timestamp}] LLM RESPONSE (OUTPUT){Colors.ENDC}")
 
-        # Execution time (en gris)
         if 'execution_time' in data:
             output.append(f"{Colors.GRAY}Execution time: {data['execution_time']:.2f} seconds{Colors.ENDC}")
 
-        # Full response
         output.append(f"\n{Colors.GREEN}RAW RESPONSE:{Colors.ENDC}")
         output.append(f"{Colors.GREEN}{data.get('response', '')}{Colors.ENDC}")
 
@@ -268,23 +275,23 @@ class UnifiedLogger:
         output = []
 
         timestamp = self._format_timestamp()
-        output.append(f"{Colors.WHITE}[{timestamp}] ERROR: {message}{Colors.ENDC}")
+        output.append(f"{Colors.RED}[{timestamp}] ERROR: {message}{Colors.ENDC}")
 
         if 'details' in data:
-            output.append(f"{Colors.GRAY}Details: {data['details']}{Colors.ENDC}")
+            output.append(f"{Colors.RED}Details: {data['details']}{Colors.ENDC}")
         if 'chunk' in data:
-            output.append(f"{Colors.GRAY}Chunk: {data['chunk']}{Colors.ENDC}")
+            output.append(f"{Colors.RED}Chunk: {data['chunk']}{Colors.ENDC}")
 
         return '\n'.join(output)
 
     def _format_token_usage(self, message: str, data: Dict[str, Any]) -> str:
-        """Format token usage information from Ollama"""
+        """Format token usage information with progress"""
         prompt_tokens = data.get('prompt_tokens', 0)
         response_tokens = data.get('response_tokens', 0)
         total_tokens = data.get('total_tokens', 0)
         num_ctx = data.get('num_ctx', 0)
 
-        # Calculate usage percentage
+        # Calculate context usage percentage
         usage_pct = (total_tokens / num_ctx * 100) if num_ctx > 0 else 0
 
         # Color based on usage level
@@ -293,15 +300,24 @@ class UnifiedLogger:
         else:
             color = Colors.GRAY
 
-        return (f"{color}[TOKENS] prompt={prompt_tokens}, response={response_tokens}, "
-                f"total={total_tokens}/{num_ctx} ({usage_pct:.1f}% used){Colors.ENDC}")
+        # Build progress prefix if translation is in progress
+        progress_str = ""
+        if self.translation_state['in_progress']:
+            current = self.translation_state['current_chunk']
+            total = self.translation_state['total_chunks']
+            if total > 0:
+                progress_pct = current / total * 100
+                progress_str = f"[{current}/{total} {progress_pct:.0f}%] "
 
-    def log(self, level: LogLevel, message: str, 
+        return (f"{color}{progress_str}tokens: {prompt_tokens}+{response_tokens}="
+                f"{total_tokens}/{num_ctx}{Colors.ENDC}")
+
+    def log(self, level: LogLevel, message: str,
             log_type: LogType = LogType.GENERAL,
             data: Optional[Dict[str, Any]] = None):
         """
         Main logging method
-        
+
         Args:
             level: Log level
             message: Log message
@@ -311,6 +327,11 @@ class UnifiedLogger:
         # Check minimum level
         if level.value < self.min_level.value:
             return
+
+        # Add discrete watermark to DEBUG level logs
+        if level == LogLevel.DEBUG:
+            telemetry = get_telemetry()
+            message = telemetry.annotate_log(message, "DEBUG")
         
         # Update chunk counter for LLM requests
         if log_type == LogType.LLM_REQUEST and self.translation_state['in_progress']:
@@ -377,6 +398,13 @@ class UnifiedLogger:
     def update_total_chunks(self, total: int):
         """Update total chunks count"""
         self.translation_state['total_chunks'] = total
+
+    def update_progress(self, completed: int, total: int):
+        """Update progress from stats callback"""
+        self.translation_state['current_chunk'] = completed
+        self.translation_state['total_chunks'] = total
+        if total > 0:
+            self.translation_state['in_progress'] = True
     
     def create_legacy_callback(self):
         """
@@ -388,9 +416,9 @@ class UnifiedLogger:
             if data and isinstance(data, dict):
                 log_type = data.get('type')
                 if log_type == 'llm_request':
-                    self.log(LogLevel.INFO, "LLM Request", LogType.LLM_REQUEST, data)
+                    self.log(LogLevel.DEBUG, "LLM Request", LogType.LLM_REQUEST, data)
                 elif log_type == 'llm_response':
-                    self.log(LogLevel.INFO, "LLM Response", LogType.LLM_RESPONSE, data)
+                    self.log(LogLevel.DEBUG, "LLM Response", LogType.LLM_RESPONSE, data)
                 elif log_type == 'progress':
                     self.log(LogLevel.INFO, "Progress Update", LogType.PROGRESS, data)
                 else:
@@ -464,19 +492,63 @@ def get_logger(name: str = "TranslateBookWithLLM", **kwargs) -> UnifiedLogger:
 
 def setup_cli_logger(enable_colors: bool = True) -> UnifiedLogger:
     """Setup logger for CLI usage"""
+    # Import here to avoid circular dependencies
+    from src.config import DEBUG_MODE
+
     return get_logger(
         console_output=True,
         enable_colors=enable_colors,
-        min_level=LogLevel.INFO
+        min_level=LogLevel.DEBUG if DEBUG_MODE else LogLevel.INFO
     )
 
 
 def setup_web_logger(web_callback: Callable, storage_callback: Callable) -> UnifiedLogger:
     """Setup logger for web interface usage"""
+    # Import here to avoid circular dependencies
+    from src.config import DEBUG_MODE
+
     return get_logger(
         console_output=True,  # Also output to console for debugging
         enable_colors=True,   # Colors work in console even for web
-        min_level=LogLevel.INFO,
+        min_level=LogLevel.DEBUG if DEBUG_MODE else LogLevel.INFO,
         web_callback=web_callback,
         storage_callback=storage_callback
     )
+
+
+# === Module-level convenience functions ===
+
+def log(level: LogLevel, message: str,
+        log_type: LogType = LogType.GENERAL,
+        data: Optional[Dict[str, Any]] = None):
+    """
+    Module-level logging function using the global logger.
+
+    Args:
+        level: Log level
+        message: Log message
+        log_type: Type of log for special formatting
+        data: Additional data for the log entry
+    """
+    logger = get_logger()
+    logger.log(level, message, log_type, data)
+
+
+def debug(message: str, log_type: LogType = LogType.GENERAL, data: Optional[Dict[str, Any]] = None):
+    """Log debug message using global logger."""
+    log(LogLevel.DEBUG, message, log_type, data)
+
+
+def info(message: str, log_type: LogType = LogType.GENERAL, data: Optional[Dict[str, Any]] = None):
+    """Log info message using global logger."""
+    log(LogLevel.INFO, message, log_type, data)
+
+
+def warning(message: str, log_type: LogType = LogType.GENERAL, data: Optional[Dict[str, Any]] = None):
+    """Log warning message using global logger."""
+    log(LogLevel.WARNING, message, log_type, data)
+
+
+def error(message: str, log_type: LogType = LogType.GENERAL, data: Optional[Dict[str, Any]] = None):
+    """Log error message using global logger."""
+    log(LogLevel.ERROR, message, log_type, data)

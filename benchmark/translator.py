@@ -2,7 +2,7 @@
 Benchmark translation wrapper.
 
 Provides a simplified interface for translating reference texts
-using Ollama or OpenRouter models for benchmark testing.
+using Ollama, OpenAI-compatible, or OpenRouter models for benchmark testing.
 """
 
 import asyncio
@@ -12,7 +12,7 @@ from typing import Optional, Callable, Union
 
 from benchmark.config import BenchmarkConfig
 from benchmark.models import ReferenceText, TranslationResult
-from src.core.llm_providers import OllamaProvider, OpenRouterProvider, LLMProvider
+from src.core.llm import OllamaProvider, OpenAICompatibleProvider, OpenRouterProvider, LLMProvider
 from src.config import TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT
 
 
@@ -28,13 +28,13 @@ class TranslationRequest:
 
 class BenchmarkTranslator:
     """
-    Wrapper for Ollama or OpenRouter translation in benchmark context.
+    Wrapper for translation in benchmark context.
 
     Simplified interface focusing on:
     - Single text translation
     - Timing measurement
     - Error handling for benchmark purposes
-    - Support for multiple providers (Ollama, OpenRouter)
+    - Support for multiple providers (Ollama, OpenAI-compatible, OpenRouter)
     """
 
     def __init__(
@@ -49,12 +49,21 @@ class BenchmarkTranslator:
         Args:
             config: Benchmark configuration
             log_callback: Optional callback for logging (level, message)
-            provider_type: Provider to use ("ollama" or "openrouter")
+            provider_type: Provider to use ("ollama", "openai", or "openrouter")
         """
         self.config = config
         self.log_callback = log_callback
         self.provider_type = provider_type.lower()
         self._providers: dict[str, LLMProvider] = {}
+
+    def _provider_label(self) -> str:
+        """Get a human-readable label for the active provider."""
+        labels = {
+            "ollama": "Ollama",
+            "openai": "OpenAI-compatible provider",
+            "openrouter": "OpenRouter",
+        }
+        return labels.get(self.provider_type, self.provider_type)
 
     def _log(self, level: str, message: str) -> None:
         """Log a message using the callback if available."""
@@ -73,6 +82,14 @@ class BenchmarkTranslator:
                 self._providers[model] = OpenRouterProvider(
                     api_key=self.config.openrouter.api_key,
                     model=model
+                )
+            elif self.provider_type == "openai":
+                self._providers[model] = OpenAICompatibleProvider(
+                    api_endpoint=self.config.openai.endpoint,
+                    api_key=self.config.openai.api_key,
+                    model=model,
+                    context_window=self.config.openai.context_window,
+                    log_callback=lambda level, msg: self._log(level, msg)
                 )
             else:
                 # Default to Ollama
@@ -187,9 +204,10 @@ Provide your translation now:"""
             )
 
             # Make the translation request
+            request_timeout = self.config.openai.timeout if self.provider_type == "openai" else self.config.ollama.timeout
             llm_response = await provider.generate(
                 prompt=user_prompt,
-                timeout=self.config.ollama.timeout,
+                timeout=request_timeout,
                 system_prompt=system_prompt
             )
 
@@ -202,7 +220,7 @@ Provide your translation now:"""
                     model=request.model,
                     translated_text="",
                     translation_time_ms=elapsed_ms,
-                    error="No response from Ollama"
+                    error=f"No response from {self._provider_label()}"
                 )
 
             # Extract response content from LLMResponse object
@@ -264,7 +282,7 @@ Provide your translation now:"""
             if progress_callback:
                 progress_callback(i + 1, total)
 
-            # Small delay to avoid overwhelming the Ollama server
+            # Small delay to avoid overwhelming the selected backend
             if i < total - 1:
                 await asyncio.sleep(0.5)
 
@@ -364,6 +382,93 @@ async def get_available_openrouter_models(config: BenchmarkConfig, text_only: bo
     except Exception as e:
         print(f"⚠️ Failed to fetch OpenRouter models: {e}")
         return [{"id": m, "name": m} for m in OpenRouterProvider.FALLBACK_MODELS]
+
+
+async def _fetch_openai_models(config: BenchmarkConfig) -> list[dict]:
+    """
+    Fetch and filter models from an OpenAI-compatible endpoint.
+
+    Args:
+        config: Benchmark configuration
+
+    Returns:
+        List of model dicts with id, name, and owned_by fields.
+        Empty list if the endpoint is unreachable or returns no models.
+    """
+    import httpx
+
+    base_url = config.openai.endpoint.replace("/chat/completions", "").rstrip("/")
+    headers = {}
+    if config.openai.api_key:
+        headers["Authorization"] = f"Bearer {config.openai.api_key}"
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.get(f"{base_url}/models", headers=headers)
+        response.raise_for_status()
+
+        data = response.json()
+        models = []
+        for model in data.get("data", []):
+            model_id = model.get("id", "")
+            if not model_id:
+                continue
+            if "embedding" in model_id.lower() or "whisper" in model_id.lower():
+                continue
+            models.append({
+                "id": model_id,
+                "name": model_id,
+                "owned_by": model.get("owned_by", "unknown"),
+            })
+
+        models.sort(key=lambda item: item["name"].lower())
+        return models
+
+
+async def get_available_openai_models(config: BenchmarkConfig) -> list[dict]:
+    """
+    Get list of available models from an OpenAI-compatible endpoint.
+
+    Args:
+        config: Benchmark configuration
+
+    Returns:
+        List of model dicts with id and name. Empty list on failure.
+    """
+    try:
+        return await _fetch_openai_models(config)
+    except Exception:
+        return []
+
+
+async def test_openai_translation_connection(config: BenchmarkConfig) -> tuple[bool, str]:
+    """
+    Test if an OpenAI-compatible endpoint is accessible for translation.
+
+    Args:
+        config: Benchmark configuration
+
+    Returns:
+        Tuple of (success, message)
+    """
+    import httpx
+
+    try:
+        models = await _fetch_openai_models(config)
+
+        if not models:
+            return False, "No OpenAI-compatible models available"
+
+        model_names = [m["id"] for m in models[:5]]
+        return True, (
+            f"OpenAI-compatible endpoint connected ({config.openai.endpoint}). "
+            f"Available models: {', '.join(model_names)}..."
+        )
+    except httpx.ConnectError:
+        return False, f"Cannot connect to OpenAI-compatible endpoint at {config.openai.endpoint}"
+    except httpx.HTTPStatusError as e:
+        return False, f"OpenAI-compatible HTTP error: {e.response.status_code}"
+    except Exception as e:
+        return False, f"OpenAI-compatible connection test failed: {e}"
 
 
 async def test_openrouter_translation_connection(config: BenchmarkConfig) -> tuple[bool, str]:

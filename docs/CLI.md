@@ -24,7 +24,7 @@ python translate.py -i input_file -o output_file
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `-o, --output` | Output file path | Auto-generated |
+| `-o, --output` | Output file path | Auto-generated as `{original} ({target_lang}).{ext}` |
 
 ### Languages
 
@@ -49,20 +49,22 @@ python translate.py -i input_file -o output_file
 | `--openai_api_key` | OpenAI API key |
 | `--gemini_api_key` | Gemini API key |
 
-### EPUB Options
+### Prompt Options
+
+| Option | Description |
+|--------|-------------|
+| `--text-cleanup` | Enable OCR/typographic cleanup (fix broken lines, spacing, punctuation) |
+| `--refine` | Enable refinement pass: runs a second pass to polish translation quality and literary style |
+
+### TTS (Text-to-Speech)
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `--fast-mode` | Use Fast Mode (strips formatting) | Off |
-| `--no-images` | Don't preserve images in Fast Mode | Off |
-
-### Performance
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-cs, --chunksize` | Lines per chunk | 25 |
-| `--timeout` | Request timeout (seconds) | 900 |
-| `--context-window` | Context window size | 2048 |
+| `--tts` | Generate audio from translated text using Edge-TTS | disabled |
+| `--tts-voice` | TTS voice name | Auto-selected based on target language |
+| `--tts-rate` | Speech rate adjustment (e.g., `+10%`, `-20%`) | +0% |
+| `--tts-bitrate` | Audio bitrate (e.g., `64k`, `96k`) | 48k |
+| `--tts-format` | Audio output format: `opus` or `mp3` | opus |
 
 ### Display
 
@@ -77,20 +79,17 @@ python translate.py -i input_file -o output_file
 ### Basic Translation
 
 ```bash
-# Text file
-python translate.py -i book.txt -o book_fr.txt -sl English -tl French
+# Text file (auto-generates "book (French).txt")
+python translate.py -i book.txt -sl English -tl French
 
-# Subtitles
-python translate.py -i movie.srt -o movie_fr.srt -tl French
+# Subtitles (auto-generates "movie (French).srt")
+python translate.py -i movie.srt -tl French
 
-# EPUB
-python translate.py -i novel.epub -o novel_fr.epub -tl French
-```
+# EPUB (auto-generates "novel (French).epub")
+python translate.py -i novel.epub -tl French
 
-### EPUB with Fast Mode
-
-```bash
-python translate.py -i book.epub -o book_fr.epub --fast-mode
+# Custom output filename
+python translate.py -i book.txt -o my_custom_name.txt -tl French
 ```
 
 ### With Different Providers
@@ -124,17 +123,30 @@ python translate.py -i book.txt -o book_fr.txt \
     -m your-model
 ```
 
-### Performance Tuning
+### With Prompt Options
 
 ```bash
-# Larger chunks for better context (needs more VRAM)
-python translate.py -i book.txt -o book_fr.txt -cs 50
+# OCR cleanup (fix broken lines, spacing from scanned documents)
+python translate.py -i scanned_book.txt -tl French --text-cleanup
 
-# Smaller chunks for limited hardware
-python translate.py -i book.txt -o book_fr.txt -cs 15
+# Refinement pass for higher quality literary translation
+python translate.py -i novel.epub -tl French --refine
 
-# Longer timeout for slow models
-python translate.py -i book.txt -o book_fr.txt --timeout 1800
+# Both options combined
+python translate.py -i scanned_book.txt -tl French --text-cleanup --refine
+```
+
+### With TTS (Text-to-Speech)
+
+```bash
+# Generate audio with auto-selected voice
+python translate.py -i book.txt -tl French --tts
+
+# Specify voice and format
+python translate.py -i book.txt -tl French --tts --tts-voice fr-FR-DeniseNeural --tts-format mp3
+
+# Adjust speech rate and quality
+python translate.py -i book.txt -tl French --tts --tts-rate "+10%" --tts-bitrate 96k
 ```
 
 ---
@@ -155,12 +167,19 @@ OPENAI_API_KEY=sk-...
 GEMINI_API_KEY=...
 
 # Performance
-MAIN_LINES_PER_CHUNK=25
 REQUEST_TIMEOUT=900
+MAX_TOKENS_PER_CHUNK=400  # Token-based chunking (default: 400 tokens)
 
 # Languages
 DEFAULT_SOURCE_LANGUAGE=English
 DEFAULT_TARGET_LANGUAGE=French
+
+# TTS
+TTS_ENABLED=false
+TTS_VOICE=               # Auto-selected if empty
+TTS_RATE=+0%
+TTS_BITRATE=48k
+TTS_OUTPUT_FORMAT=opus
 ```
 
 ---
@@ -171,11 +190,3 @@ DEFAULT_TARGET_LANGUAGE=French
 |------|---------|
 | 0 | Success |
 | 1 | Error (check console output) |
-
----
-
-## Output Location
-
-By default, translated files are saved in `translated_files/` directory.
-
-Configure with `OUTPUT_DIR` environment variable.

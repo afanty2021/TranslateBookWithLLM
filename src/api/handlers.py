@@ -2,6 +2,7 @@
 Translation job handlers and processing logic
 """
 import os
+import re
 import time
 import asyncio
 import tempfile
@@ -9,10 +10,11 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
-from src.core.epub import translate_epub_file
 from src.utils.unified_logger import setup_web_logger, LogType
 from src.utils.file_utils import get_unique_output_path, generate_tts_for_translation
-from src.core.llm_providers import OpenRouterProvider
+from src.core.llm import OpenRouterProvider
+from src.core.llm.exceptions import RateLimitError
+from src.core.adapters import translate_file
 from src.tts.tts_config import TTSConfig
 from .websocket import emit_update
 
@@ -34,7 +36,6 @@ def run_translation_async_wrapper(translation_id, config, state_manager, output_
         loop.run_until_complete(perform_actual_translation(translation_id, config, state_manager, output_dir, socketio))
     except Exception as e:
         error_msg = f"Uncaught major error in translation wrapper {translation_id}: {str(e)}"
-        print(error_msg)
         if state_manager.exists(translation_id):
             state_manager.set_translation_field(translation_id, 'status', 'error')
             state_manager.set_translation_field(translation_id, 'error', error_msg)
@@ -60,7 +61,6 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
         socketio: SocketIO instance
     """
     if not state_manager.exists(translation_id):
-        print(f"Critical error: {translation_id} not found in state_manager.")
         return
 
     state_manager.set_translation_field(translation_id, 'status', 'running')
@@ -103,14 +103,16 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
         if data and isinstance(data, dict):
             log_type = data.get('type')
             if log_type == 'llm_request':
-                logger.info("LLM Request", LogType.LLM_REQUEST, data)
+                logger.debug("LLM Request", LogType.LLM_REQUEST, data)
             elif log_type == 'llm_response':
+                # Use INFO level to ensure translation preview works even when DEBUG_MODE=false
                 logger.info("LLM Response", LogType.LLM_RESPONSE, data)
             elif log_type == 'refinement_request':
                 # Refinement uses same log type as LLM request for UI display
-                logger.info("Refinement Request", LogType.LLM_REQUEST, data)
+                logger.debug("Refinement Request", LogType.LLM_REQUEST, data)
             elif log_type == 'refinement_response':
                 # Refinement uses same log type as LLM response for UI display
+                # Use INFO level to ensure translation preview works even when DEBUG_MODE=false
                 logger.info("Refinement Response", LogType.LLM_RESPONSE, data)
             elif log_type == 'progress':
                 logger.info("Progress Update", LogType.PROGRESS, data)
@@ -125,13 +127,6 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
             else:
                 logger.info(message_content)
 
-    def _update_translation_progress_callback(progress_percent):
-        if state_manager.exists(translation_id):
-            if not state_manager.get_translation_field(translation_id, 'interrupted'):
-                state_manager.set_translation_field(translation_id, 'progress', progress_percent)
-            progress = state_manager.get_translation_field(translation_id, 'progress')
-            emit_update(socketio, translation_id, {'progress': progress}, state_manager)
-
     def _update_translation_stats_callback(new_stats_dict):
         if state_manager.exists(translation_id):
             state_manager.update_stats(translation_id, new_stats_dict)
@@ -139,6 +134,12 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
             current_stats['elapsed_time'] = time.time() - current_stats.get('start_time', time.time())
             state_manager.set_translation_field(translation_id, 'stats', current_stats)
             emit_update(socketio, translation_id, {'stats': current_stats}, state_manager)
+
+            # Update logger progress for CLI display
+            completed = current_stats.get('completed_chunks', 0)
+            total = current_stats.get('total_chunks', 0)
+            if total > 0:
+                logger.update_progress(completed, total)
 
     def _openrouter_cost_callback(cost_data):
         """Callback to update OpenRouter cost information in real-time"""
@@ -174,23 +175,7 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
                 input_file_path
             )
 
-        # PHASE 2: Validation and warnings at startup
-        if config.get('llm_provider', 'ollama') == 'ollama':
-            from src.core.context_optimizer import validate_configuration
-
-            warnings = validate_configuration(
-                chunk_size=config.get('chunk_size', 25),
-                num_ctx=config.get('context_window', 2048),
-                model_name=config['model']
-            )
-
-            # Send warnings to client via WebSocket
-            for warning in warnings:
-                emit_update(socketio, translation_id, {
-                    'type': 'warning',
-                    'message': warning
-                }, state_manager)
-                _log_message_callback("context_validation_warning", warning)
+        # PHASE 2: Configuration validation is now handled by AdaptiveContextManager during translation
 
         # Generate unique output filename to avoid overwriting
         tentative_output_path = os.path.join(output_dir, config['output_filename'])
@@ -216,115 +201,100 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
         })
         
         input_path_for_translate_module = config.get('file_path')
-        if config['file_type'] == 'epub':
-            if not input_path_for_translate_module:
-                _log_message_callback("epub_error_no_path", "❌ EPUB translation requires a file path from upload.")
-                raise Exception("EPUB translation requires a file_path.")
 
-            await translate_epub_file(
-                input_path_for_translate_module,
-                output_filepath_on_server,
-                config['source_language'],
-                config['target_language'],
-                config['model'],
-                config['chunk_size'],
-                config['llm_api_endpoint'],
-                progress_callback=_update_translation_progress_callback,
-                log_callback=_log_message_callback,
-                stats_callback=_update_translation_stats_callback,
-                check_interruption_callback=should_interrupt_current_task,
-                llm_provider=config.get('llm_provider', 'ollama'),
-                gemini_api_key=config.get('gemini_api_key', ''),
-                openai_api_key=config.get('openai_api_key', ''),
-                openrouter_api_key=config.get('openrouter_api_key', ''),
-                fast_mode=config.get('fast_mode', False),
-                context_window=config.get('context_window', 2048),
-                auto_adjust_context=config.get('auto_adjust_context', True),
-                min_chunk_size=config.get('min_chunk_size', 5),
-                checkpoint_manager=checkpoint_manager,
-                translation_id=translation_id,
-                resume_from_index=resume_from_index,
-                prompt_options=config.get('prompt_options', {})
-            )
-            state_manager.set_translation_field(translation_id, 'result', "[EPUB file translated - download to view]")
-            
-        elif config['file_type'] == 'txt':
-            temp_txt_file_path = None
-            if 'text' in config and input_path_for_translate_module is None:
-                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".txt", dir=output_dir) as tmp_f:
-                    tmp_f.write(config['text'])
-                    temp_txt_file_path = tmp_f.name
-                input_path_for_translate_module = temp_txt_file_path
+        # Handle special case for TXT with inline text content (no file upload)
+        temp_txt_file_path = None
+        if config['file_type'] == 'txt' and 'text' in config and input_path_for_translate_module is None:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", delete=False, suffix=".txt", dir=output_dir) as tmp_f:
+                tmp_f.write(config['text'])
+                temp_txt_file_path = tmp_f.name
+            input_path_for_translate_module = temp_txt_file_path
 
-            # Use unified file processing logic
-            from src.utils.file_utils import translate_text_file_with_callbacks
+        # Validate input file path
+        if not input_path_for_translate_module:
+            _log_message_callback("error_no_path", f"❌ {config['file_type'].upper()} translation requires a file path from upload.")
+            raise Exception(f"{config['file_type'].upper()} translation requires a file_path.")
 
-            await translate_text_file_with_callbacks(
-                input_path_for_translate_module,
-                output_filepath_on_server,
-                config['source_language'],
-                config['target_language'],
-                config['model'],
-                config['chunk_size'],
-                config['llm_api_endpoint'],
-                progress_callback=_update_translation_progress_callback,
-                log_callback=_log_message_callback,
-                stats_callback=_update_translation_stats_callback,
-                check_interruption_callback=should_interrupt_current_task,
-                llm_provider=config.get('llm_provider', 'ollama'),
-                gemini_api_key=config.get('gemini_api_key', ''),
-                openai_api_key=config.get('openai_api_key', ''),
-                openrouter_api_key=config.get('openrouter_api_key', ''),
-                context_window=config.get('context_window', 2048),
-                auto_adjust_context=config.get('auto_adjust_context', True),
-                min_chunk_size=config.get('min_chunk_size', 5),
-                fast_mode=True,  # TXT files never have placeholders
-                checkpoint_manager=checkpoint_manager,
-                translation_id=translation_id,
-                resume_from_index=resume_from_index,
-                prompt_options=config.get('prompt_options', {})
-            )
+        # Read custom instruction file if specified
+        custom_instructions_content = ""
+        custom_instruction_file = config.get('prompt_options', {}).get('custom_instruction_file', '')
 
-            if os.path.exists(output_filepath_on_server) and state_manager.get_translation_field(translation_id, 'status') not in ['error', 'interrupted_before_save']:
-                state_manager.set_translation_field(translation_id, 'result', "[TXT file translated - content available for download]")
-            elif not os.path.exists(output_filepath_on_server):
-                state_manager.set_translation_field(translation_id, 'result', "[TXT file (partially) translated - content not loaded for preview or write failed]")
+        if custom_instruction_file:
+            try:
+                project_root = Path(os.getcwd())
+                custom_instructions_dir = project_root / 'Custom_Instructions'
 
-            if temp_txt_file_path and os.path.exists(temp_txt_file_path):
-                os.remove(temp_txt_file_path)
-                
-        elif config['file_type'] == 'srt':
-            # Use unified file processing logic
-            from src.utils.file_utils import translate_srt_file_with_callbacks
-            
-            await translate_srt_file_with_callbacks(
-                input_path_for_translate_module,
-                output_filepath_on_server,
-                config['source_language'],
-                config['target_language'],
-                config['model'],
-                config['chunk_size'],
-                config['llm_api_endpoint'],
-                progress_callback=_update_translation_progress_callback,
-                log_callback=_log_message_callback,
-                stats_callback=_update_translation_stats_callback,
-                check_interruption_callback=should_interrupt_current_task,
-                llm_provider=config.get('llm_provider', 'ollama'),
-                gemini_api_key=config.get('gemini_api_key', ''),
-                openai_api_key=config.get('openai_api_key', ''),
-                openrouter_api_key=config.get('openrouter_api_key', ''),
-                checkpoint_manager=checkpoint_manager,
-                translation_id=translation_id,
-                resume_from_block_index=resume_from_index
-            )
-            
-            state_manager.set_translation_field(translation_id, 'result', "[SRT file translated - download to view]")
-            
-        else:
-            _log_message_callback("unknown_file_type", f"❌ Unknown file type: {config['file_type']}")
-            raise Exception(f"Unsupported file type: {config['file_type']}")
+                # Security: validate filename pattern (prevent directory traversal)
+                safe_filename_pattern = r'^[a-zA-Z0-9_\-\.]+\.txt$'
+                if re.match(safe_filename_pattern, custom_instruction_file):
+                    file_path = custom_instructions_dir / custom_instruction_file
 
-        _log_message_callback("save_process_info", f"💾 Translation process ended. File saved (or partially saved) at: {output_filepath_on_server}")
+                    # Security: ensure file is within Custom_Instructions folder
+                    try:
+                        file_path.resolve().relative_to(custom_instructions_dir.resolve())
+
+                        if file_path.exists() and file_path.is_file():
+                            with open(file_path, 'r', encoding='utf-8') as f:
+                                custom_instructions_content = f.read().strip()
+
+                            if custom_instructions_content:
+                                _log_message_callback("custom_instructions", f"📝 Loaded custom instructions: {custom_instruction_file}")
+                    except ValueError:
+                        pass  # Silently ignore invalid paths (security requirement)
+            except Exception as e:
+                pass  # Silently ignore errors (requirement from plan)
+
+        # Inject custom instructions into prompt_options
+        if custom_instructions_content:
+            # Ensure prompt_options exists
+            if 'prompt_options' not in config:
+                config['prompt_options'] = {}
+
+            # For refinement prompts (existing mechanism - already fully supported)
+            config['prompt_options']['refinement_instructions'] = custom_instructions_content
+            # For translation prompts (new)
+            config['prompt_options']['custom_instructions'] = custom_instructions_content
+
+        # Use unified adapter-based translation
+        await translate_file(
+            input_filepath=input_path_for_translate_module,
+            output_filepath=output_filepath_on_server,
+            source_language=config['source_language'],
+            target_language=config['target_language'],
+            model_name=config['model'],
+            llm_provider=config.get('llm_provider', 'ollama'),
+            checkpoint_manager=checkpoint_manager,
+            translation_id=translation_id,
+            log_callback=_log_message_callback,
+            stats_callback=_update_translation_stats_callback,
+            check_interruption_callback=should_interrupt_current_task,
+            resume_from_index=resume_from_index,
+            llm_api_endpoint=config['llm_api_endpoint'],
+            gemini_api_key=config.get('gemini_api_key', ''),
+            openai_api_key=config.get('openai_api_key', ''),
+            openrouter_api_key=config.get('openrouter_api_key', ''),
+            mistral_api_key=config.get('mistral_api_key', ''),
+            deepseek_api_key=config.get('deepseek_api_key', ''),
+            poe_api_key=config.get('poe_api_key', ''),
+            nim_api_key=config.get('nim_api_key', ''),
+            context_window=config.get('context_window', 2048),
+            auto_adjust_context=config.get('auto_adjust_context', True),
+            min_chunk_size=config.get('min_chunk_size', 5),
+            prompt_options=config.get('prompt_options', {}),
+            bilingual_output=config.get('bilingual_output', False)
+        )
+
+        # Set result message based on file type
+        file_type_upper = config['file_type'].upper()
+        if os.path.exists(output_filepath_on_server) and state_manager.get_translation_field(translation_id, 'status') not in ['error', 'interrupted_before_save']:
+            state_manager.set_translation_field(translation_id, 'result', f"[{file_type_upper} file translated - download to view]")
+        elif not os.path.exists(output_filepath_on_server):
+            state_manager.set_translation_field(translation_id, 'result', f"[{file_type_upper} file (partially) translated - content not loaded for preview or write failed]")
+
+        # Clean up temporary text file if created
+        if temp_txt_file_path and os.path.exists(temp_txt_file_path):
+            os.remove(temp_txt_file_path)
+
         state_manager.set_translation_field(translation_id, 'output_filepath', output_filepath_on_server)
 
         stats = state_manager.get_translation_field(translation_id, 'stats') or {}
@@ -336,16 +306,14 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
             'output_filename': config['output_filename'],
             'file_type': config['file_type']
         }
-        
+
         if state_manager.get_translation_field(translation_id, 'interrupted'):
             state_manager.set_translation_field(translation_id, 'status', 'interrupted')
-            _log_message_callback("summary_interrupted", f"🛑 Translation interrupted by user. Partial result saved. Time: {elapsed_time:.2f}s.")
+            _log_message_callback("summary_interrupted", f"🛑 Translation interrupted - partial result saved ({elapsed_time:.2f}s)")
             final_status_payload['status'] = 'interrupted'
-            final_status_payload['progress'] = state_manager.get_translation_field(translation_id, 'progress') or 0
 
             # Mark checkpoint as interrupted in database
             checkpoint_manager.mark_interrupted(translation_id)
-            _log_message_callback("checkpoint_interrupted", "⏸️ Checkpoint marked as interrupted")
 
             # Emit checkpoint_created event to trigger UI update
             socketio.emit('checkpoint_created', {
@@ -385,20 +353,36 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
 
         elif state_manager.get_translation_field(translation_id, 'status') != 'error':
             state_manager.set_translation_field(translation_id, 'status', 'completed')
-            _log_message_callback("summary_completed", f"✅ Translation completed. Time: {elapsed_time:.2f}s.")
+
+            # Get stats for consolidated message
+            final_stats = stats
+            stats_summary = ""
+            if config['file_type'] == 'txt' or (config['file_type'] == 'epub' and stats.get('total_chunks', 0) > 0):
+                completed = final_stats.get('completed_chunks', 0)
+                failed = final_stats.get('failed_chunks', 0)
+                total = final_stats.get('total_chunks', 0)
+                stats_summary = f" | {completed}/{total} chunks"
+                if failed > 0:
+                    stats_summary += f" ({failed} failed)"
+            elif config['file_type'] == 'srt' and stats.get('total_subtitles', 0) > 0:
+                completed = final_stats.get('completed_subtitles', 0)
+                failed = final_stats.get('failed_subtitles', 0)
+                total = final_stats.get('total_subtitles', 0)
+                stats_summary = f" | {completed}/{total} subtitles"
+                if failed > 0:
+                    stats_summary += f" ({failed} failed)"
+
+            # Single consolidated completion message
+            _log_message_callback("summary_completed", f"✅ Translation completed in {elapsed_time:.2f}s{stats_summary}")
+
             final_status_payload['status'] = 'completed'
-            _update_translation_progress_callback(100)
-            final_status_payload['progress'] = 100
 
             # Cleanup completed job checkpoint (automatic immediate cleanup)
             checkpoint_manager.cleanup_completed_job(translation_id)
-            _log_message_callback("checkpoint_cleanup", "🗑️ Checkpoint cleaned up automatically")
-            
+
             # Clean up uploaded file if it exists and is in the uploads directory
             # On completion, we can safely delete the original upload file
-            _log_message_callback("cleanup_start", f"🧹 Starting cleanup check...")
             if 'file_path' in config and config['file_path']:
-                _log_message_callback("cleanup_filepath", f"📁 File path in config: {config['file_path']}")
                 uploaded_file_path = config['file_path']
                 # Convert to Path object for reliable path operations
                 upload_path = Path(uploaded_file_path)
@@ -413,26 +397,15 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
                         # Check if file is directly in uploads/ (not in a job subdirectory)
                         if resolved_path.parent.resolve() == uploads_dir.resolve():
                             upload_path.unlink()
-                            _log_message_callback("cleanup_uploaded_file", f"🗑️ Cleaned up uploaded source file: {upload_path.name}")
-                        else:
-                            _log_message_callback("cleanup_skipped", f"ℹ️ Skipped cleanup - file is not in uploads root directory")
+                            # Removed verbose cleanup message - file cleanup is automatic
                     except Exception as e:
                         _log_message_callback("cleanup_error", f"⚠️ Could not delete uploaded file {upload_path.name}: {str(e)}")
-            else:
-                _log_message_callback("cleanup_no_filepath", f"📂 No file_path in config for cleanup")
         else:
-            _log_message_callback("summary_error_final", f"❌ Translation finished with errors. Time: {elapsed_time:.2f}s.")
+            _log_message_callback("summary_error_final", f"❌ Translation finished with errors ({elapsed_time:.2f}s)")
             final_status_payload['status'] = 'error'
             final_status_payload['error'] = state_manager.get_translation_field(translation_id, 'error') or 'Unknown error during finalization.'
-            final_status_payload['progress'] = state_manager.get_translation_field(translation_id, 'progress') or 0
-        
-        stats = state_manager.get_translation_field(translation_id, 'stats') or {}
-        if config['file_type'] == 'txt' or (config['file_type'] == 'epub' and stats.get('total_chunks', 0) > 0):
-            final_stats = stats
-            _log_message_callback("summary_stats_final", f"📊 Stats: {final_stats.get('completed_chunks', 0)} processed, {final_stats.get('failed_chunks', 0)} failed out of {final_stats.get('total_chunks', 0)} total segments/chunks.")
-        elif config['file_type'] == 'srt' and stats.get('total_subtitles', 0) > 0:
-            final_stats = stats
-            _log_message_callback("summary_stats_final", f"📊 Stats: {final_stats.get('completed_subtitles', 0)} processed, {final_stats.get('failed_subtitles', 0)} failed out of {final_stats.get('total_subtitles', 0)} total subtitles.")
+
+        # Stats are now included in the consolidated completion message above
 
         # Log OpenRouter cost summary if applicable
         if config.get('llm_provider') == 'openrouter':
@@ -466,24 +439,61 @@ async def perform_actual_translation(translation_id, config, state_manager, outp
                 'filename': config.get('output_filename', 'unknown')
             }, namespace='/')
 
+    except RateLimitError as e:
+        # Auto-pause on rate limit — save checkpoint so user can resume later
+        retry_msg = f" Retry suggested after ~{e.retry_after}s." if e.retry_after else ""
+        provider_name = e.provider or config.get('llm_provider', 'API')
+        pause_msg = f"⏸️ Rate limited by {provider_name}.{retry_msg} Translation auto-paused — you can resume when ready."
+
+        _log_message_callback("rate_limit_auto_pause", pause_msg)
+
+        if state_manager.exists(translation_id):
+            state_manager.set_translation_field(translation_id, 'status', 'rate_limited')
+            state_manager.set_translation_field(translation_id, 'interrupted', True)
+
+            # Mark checkpoint as interrupted so it appears in resumable jobs
+            checkpoint_manager.mark_interrupted(translation_id)
+
+            stats = state_manager.get_translation_field(translation_id, 'stats') or {}
+            elapsed_time = time.time() - stats.get('start_time', time.time())
+            _update_translation_stats_callback({'elapsed_time': elapsed_time})
+
+            # Emit rate_limited status + checkpoint_created for UI
+            emit_update(socketio, translation_id, {
+                'status': 'rate_limited',
+                'log': pause_msg,
+                'result': state_manager.get_translation_field(translation_id, 'result') or f"Translation paused (rate limited)"
+            }, state_manager)
+
+            socketio.emit('checkpoint_created', {
+                'translation_id': translation_id,
+                'status': 'rate_limited',
+                'message': pause_msg
+            }, namespace='/')
+
+            # Trigger file list refresh for partial output
+            output_filepath = state_manager.get_translation_field(translation_id, 'output_filepath')
+            if output_filepath and os.path.exists(output_filepath):
+                socketio.emit('file_list_changed', {
+                    'reason': 'rate_limited',
+                    'filename': config.get('output_filename', 'unknown')
+                }, namespace='/')
+
     except Exception as e:
         critical_error_msg = f"Critical error during translation task ({translation_id}): {str(e)}"
         _log_message_callback("critical_error_perform_task", critical_error_msg)
-        print(f"!!! {critical_error_msg}")
         import traceback
         tb_str = traceback.format_exc()
         _log_message_callback("critical_error_perform_task_traceback", tb_str)
-        print(tb_str)
 
         if state_manager.exists(translation_id):
             state_manager.set_translation_field(translation_id, 'status', 'error')
             state_manager.set_translation_field(translation_id, 'error', critical_error_msg)
-            
+
             emit_update(socketio, translation_id, {
-                'error': critical_error_msg, 
+                'error': critical_error_msg,
                 'status': 'error',
-                'result': state_manager.get_translation_field(translation_id, 'result') or f"Translation failed: {critical_error_msg}",
-                'progress': state_manager.get_translation_field(translation_id, 'progress') or 0
+                'result': state_manager.get_translation_field(translation_id, 'result') or f"Translation failed: {critical_error_msg}"
             }, state_manager)
 
 

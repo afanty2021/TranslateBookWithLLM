@@ -9,12 +9,12 @@ import zipfile
 from pathlib import Path
 from typing import Optional, Callable, Tuple
 
-from src.core.text_processor import split_text_into_chunks_with_context, split_text_into_chunks
+from src.core.text_processor import split_text_into_chunks
 from src.core.translator import translate_chunks, refine_chunks
 from src.core.subtitle_translator import translate_subtitles, translate_subtitles_in_blocks
 from src.core.epub import translate_epub_file
 from src.core.srt_processor import SRTProcessor
-from src.config import DEFAULT_MODEL, MAIN_LINES_PER_CHUNK, API_ENDPOINT, SRT_LINES_PER_BLOCK, SRT_MAX_CHARS_PER_BLOCK
+from src.config import DEFAULT_MODEL, API_ENDPOINT, SRT_LINES_PER_BLOCK, SRT_MAX_CHARS_PER_BLOCK
 
 
 def get_unique_output_path(output_path):
@@ -61,19 +61,24 @@ def get_unique_output_path(output_path):
 
 async def translate_text_file_with_callbacks(input_filepath, output_filepath,
                                              source_language="English", target_language="Chinese",
-                                             model_name=DEFAULT_MODEL, chunk_target_lines_cli=MAIN_LINES_PER_CHUNK,
+                                             model_name=DEFAULT_MODEL,
                                              cli_api_endpoint=API_ENDPOINT,
-                                             progress_callback=None, log_callback=None, stats_callback=None,
+                                             log_callback=None, stats_callback=None,
                                              check_interruption_callback=None,
                                              llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
                                              openrouter_api_key=None,
                                              context_window=2048, auto_adjust_context=True, min_chunk_size=5,
-                                             fast_mode=False, checkpoint_manager=None, translation_id=None,
+                                             checkpoint_manager=None, translation_id=None,
                                              resume_from_index=0,
-                                             use_token_chunking=None, max_tokens_per_chunk=None,
+                                             max_tokens_per_chunk=None,
                                              soft_limit_ratio=None, prompt_options=None):
     """
     Translate a text file with callback support
+
+    .. deprecated:: Phase 6
+        This function is deprecated and will be removed in a future version.
+        Use :func:`src.core.adapters.translate_file` instead, which provides
+        a unified interface for all file formats using the adapter pattern.
 
     Args:
         input_filepath (str): Path to input file
@@ -81,23 +86,27 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
         source_language (str): Source language
         target_language (str): Target language
         model_name (str): LLM model name
-        chunk_target_lines_cli (int): Target lines per chunk (legacy mode)
-        cli_api_endpoint (str): API endpoint
-        progress_callback (callable): Progress callback
-        log_callback (callable): Logging callback
+        cli_api_endpoint (str): API endpoint        log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
-        fast_mode (bool): If True, uses simplified prompts without placeholder instructions
-        use_token_chunking (bool): If True, use token-based chunking instead of line-based
-        max_tokens_per_chunk (int): Maximum tokens per chunk (token mode)
+        max_tokens_per_chunk (int): Maximum tokens per chunk
         soft_limit_ratio (float): Soft limit ratio for token chunking (default 0.8)
         prompt_options (dict): Optional dict with prompt customization options
     """
+    # Issue deprecation warning
+    import warnings
+    warnings.warn(
+        "translate_text_file_with_callbacks is deprecated and will be removed in a future version. "
+        "Use src.core.adapters.translate_file instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
     if not os.path.exists(input_filepath):
         err_msg = f"ERROR: Input file '{input_filepath}' not found."
-        if log_callback: 
+        if log_callback:
             log_callback("file_not_found_error", err_msg)
-        else: 
+        else:
             print(err_msg)
         return
 
@@ -115,14 +124,47 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
     if log_callback:
         log_callback("txt_split_start", f"Splitting text from '{source_language}'...")
 
-    # Use the new unified chunking function (token-based or line-based)
-    structured_chunks = split_text_into_chunks(
-        original_text,
-        use_token_chunking=use_token_chunking,
-        max_tokens_per_chunk=max_tokens_per_chunk,
-        soft_limit_ratio=soft_limit_ratio,
-        chunk_size=chunk_target_lines_cli
-    )
+    # Check if we're resuming and have saved chunks structure
+    is_resume = checkpoint_manager and translation_id and resume_from_index > 0
+
+    if is_resume:
+        # Load checkpoint data to get the original chunks structure
+        checkpoint_data = checkpoint_manager.load_checkpoint(translation_id)
+        if checkpoint_data and checkpoint_data['job'].get('config', {}).get('saved_chunks_structure'):
+            # Use the saved chunks structure from original translation
+            import json
+            structured_chunks = json.loads(checkpoint_data['job']['config']['saved_chunks_structure'])
+            if log_callback:
+                log_callback("txt_resume_chunks", f"✅ Resuming with original chunk structure ({len(structured_chunks)} chunks)")
+        else:
+            # Fallback: re-chunk (this was the old buggy behavior)
+            if log_callback:
+                log_callback("txt_resume_warning", "⚠️ Warning: No saved chunk structure found, re-chunking (may cause alignment issues)")
+            structured_chunks = split_text_into_chunks(
+                original_text,
+                max_tokens_per_chunk=max_tokens_per_chunk,
+                soft_limit_ratio=soft_limit_ratio
+            )
+    else:
+        # New translation: chunk normally
+        structured_chunks = split_text_into_chunks(
+            original_text,
+            max_tokens_per_chunk=max_tokens_per_chunk,
+            soft_limit_ratio=soft_limit_ratio
+        )
+
+    # Save the chunks structure for potential resume (for both new and resumed translations)
+    # This ensures the structure is always available for future resumes
+    if checkpoint_manager and translation_id and not is_resume:
+        import json
+        job = checkpoint_manager.get_job(translation_id)
+        if job:
+            config = job['config']
+            config['saved_chunks_structure'] = json.dumps(structured_chunks)
+            checkpoint_manager.update_job_config(translation_id, config)
+            if log_callback:
+                log_callback("txt_save_chunks_structure", f"💾 Saved chunk structure for resume capability")
+
     total_chunks = len(structured_chunks)
 
     if stats_callback and total_chunks > 0:
@@ -147,23 +189,17 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
                 log_callback("txt_empty_output_created", f"Empty output file '{output_filepath}' created.")
         except Exception as e:
             err_msg = f"ERROR: Saving empty file '{output_filepath}': {e}"
-            if log_callback: 
+            if log_callback:
                 log_callback("txt_empty_save_error", err_msg)
-        if progress_callback: 
-            progress_callback(100)
-        return
+            return
 
     if log_callback:
         log_callback("txt_translation_info_lang", f"Translating from {source_language} to {target_language}.")
         log_callback("txt_translation_info_chunks1", f"{total_chunks} main segments in memory.")
-        # Show appropriate info based on chunking mode
-        from src.config import USE_TOKEN_CHUNKING, MAX_TOKENS_PER_CHUNK
-        _use_tokens = use_token_chunking if use_token_chunking is not None else USE_TOKEN_CHUNKING
-        if _use_tokens:
-            _max_tokens = max_tokens_per_chunk if max_tokens_per_chunk is not None else MAX_TOKENS_PER_CHUNK
-            log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{_max_tokens} tokens.")
-        else:
-            log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{chunk_target_lines_cli} lines.")
+        # Show token-based chunking info
+        from src.config import MAX_TOKENS_PER_CHUNK
+        _max_tokens = max_tokens_per_chunk if max_tokens_per_chunk is not None else MAX_TOKENS_PER_CHUNK
+        log_callback("txt_translation_info_chunks2", f"Target size per segment: ~{_max_tokens} tokens.")
 
     # Check if refinement is enabled
     enable_refinement = prompt_options.get('refine', False) if prompt_options else False
@@ -173,24 +209,16 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
         if enable_refinement:
             log_callback("refinement_info", "📝 Translation will use 2-pass mode: translate → refine")
 
-    # Adjust progress for refinement (translation = 0-50%, refinement = 50-100%)
-    def translation_progress(pct):
-        if progress_callback:
-            if enable_refinement:
-                # Translation is first half (0-50%)
-                progress_callback(pct * 0.5)
-            else:
-                progress_callback(pct)
+    # Progress is handled directly by translator.py's ProgressTracker
+    # which automatically accounts for refinement phase (50/50 split)
 
     # Translate chunks
-    translated_parts = await translate_chunks(
+    translated_parts, progress_tracker = await translate_chunks(
         structured_chunks,
         source_language,
         target_language,
         model_name,
-        cli_api_endpoint,
-        progress_callback=translation_progress,
-        log_callback=log_callback,
+        cli_api_endpointlog_callback=log_callback,
         stats_callback=stats_callback,
         check_interruption_callback=check_interruption_callback,
         llm_provider=llm_provider,
@@ -200,11 +228,11 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
         context_window=context_window,
         auto_adjust_context=auto_adjust_context,
         min_chunk_size=min_chunk_size,
-        fast_mode=fast_mode,
         checkpoint_manager=checkpoint_manager,
         translation_id=translation_id,
         resume_from_index=resume_from_index,
-        prompt_options=prompt_options
+        prompt_options=prompt_options,
+        enable_refinement=enable_refinement
     )
 
     # Refinement pass (if enabled and not interrupted)
@@ -221,7 +249,6 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
             target_language=target_language,
             model_name=model_name,
             api_endpoint=cli_api_endpoint,
-            progress_callback=progress_callback,
             log_callback=log_callback,
             stats_callback=stats_callback,
             check_interruption_callback=check_interruption_callback,
@@ -231,25 +258,21 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
             openrouter_api_key=openrouter_api_key,
             context_window=context_window,
             auto_adjust_context=auto_adjust_context,
-            fast_mode=fast_mode,
-            prompt_options=prompt_options
+            prompt_options=prompt_options,
+            progress_tracker=progress_tracker
         )
     elif enable_refinement and was_interrupted:
         if log_callback:
             log_callback("refinement_skipped", "⏭️ Refinement pass skipped (translation was interrupted)")
-
-    if progress_callback:
-        progress_callback(100)
-
     # Add signature footer if enabled
-    from src.config import SIGNATURE_ENABLED, PROJECT_NAME, PROJECT_GITHUB
+    from src.config import ATTRIBUTION_ENABLED, GENERATOR_NAME, GENERATOR_SOURCE
 
     final_translated_text = "\n".join(translated_parts)
 
-    if SIGNATURE_ENABLED:
+    if ATTRIBUTION_ENABLED:
         signature_footer = f"\n\n{'='*60}\n"
-        signature_footer += f"Translated with {PROJECT_NAME}\n"
-        signature_footer += f"{PROJECT_GITHUB}\n"
+        signature_footer += f"Translated with {GENERATOR_NAME}\n"
+        signature_footer += f"{GENERATOR_SOURCE}\n"
         signature_footer += f"{'='*60}\n"
         final_translated_text += signature_footer
 
@@ -269,9 +292,9 @@ async def translate_text_file_with_callbacks(input_filepath, output_filepath,
 
 async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
                                            source_language="English", target_language="Chinese",
-                                           model_name=DEFAULT_MODEL, chunk_target_lines_cli=MAIN_LINES_PER_CHUNK,
+                                           model_name=DEFAULT_MODEL,
                                            cli_api_endpoint=API_ENDPOINT,
-                                           progress_callback=None, log_callback=None, stats_callback=None,
+                                           log_callback=None, stats_callback=None,
                                            check_interruption_callback=None,
                                            llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
                                            openrouter_api_key=None,
@@ -280,20 +303,31 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
     """
     Translate an SRT subtitle file with callback support
 
+    .. deprecated:: Phase 6
+        This function is deprecated and will be removed in a future version.
+        Use :func:`src.core.adapters.translate_file` instead, which provides
+        a unified interface for all file formats using the adapter pattern.
+
     Args:
         input_filepath (str): Path to input SRT file
         output_filepath (str): Path to output SRT file
         source_language (str): Source language
         target_language (str): Target language
         model_name (str): LLM model name
-        chunk_target_lines_cli (int): Not used for SRT (kept for consistency)
-        cli_api_endpoint (str): API endpoint
-        progress_callback (callable): Progress callback
-        log_callback (callable): Logging callback
+        cli_api_endpoint (str): API endpoint        log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
         prompt_options (dict): Optional prompt customization options (not yet used for SRT)
     """
+    # Issue deprecation warning
+    import warnings
+    warnings.warn(
+        "translate_srt_file_with_callbacks is deprecated and will be removed in a future version. "
+        "Use src.core.adapters.translate_file instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
     # Note: prompt_options is accepted but not yet propagated to subtitle translation
     # SRT uses a specialized prompt (generate_subtitle_block_prompt) that doesn't use prompt_options yet
     if not os.path.exists(input_filepath):
@@ -354,38 +388,77 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
         })
     
     # Group subtitles into blocks for translation
-    if log_callback:
-        log_callback("srt_grouping", f"Grouping {len(subtitles)} subtitles into blocks...")
-    
-    # Use SRT-specific configuration for block sizes
-    lines_per_block = SRT_LINES_PER_BLOCK
-    subtitle_blocks = srt_processor.group_subtitles_for_translation(
-        subtitles, 
-        lines_per_block=lines_per_block,
-        max_chars_per_block=SRT_MAX_CHARS_PER_BLOCK
-    )
+    # Check if we're resuming and have saved blocks structure
+    is_resume = checkpoint_manager and translation_id and resume_from_block_index > 0
+
+    if is_resume:
+        # Load checkpoint data to get the original blocks structure
+        checkpoint_data = checkpoint_manager.load_checkpoint(translation_id)
+        if checkpoint_data and checkpoint_data['job'].get('config', {}).get('saved_subtitle_blocks'):
+            # Use the saved blocks structure from original translation
+            import json
+            subtitle_blocks = json.loads(checkpoint_data['job']['config']['saved_subtitle_blocks'])
+            if log_callback:
+                log_callback("srt_resume_blocks", f"✅ Resuming with original block structure ({len(subtitle_blocks)} blocks)")
+        else:
+            # Fallback: re-group (this was the old buggy behavior)
+            if log_callback:
+                log_callback("srt_resume_warning", "⚠️ Warning: No saved block structure found, re-grouping (may cause alignment issues)")
+                log_callback("srt_grouping", f"Grouping {len(subtitles)} subtitles into blocks...")
+            lines_per_block = SRT_LINES_PER_BLOCK
+            subtitle_blocks = srt_processor.group_subtitles_for_translation(
+                subtitles,
+                lines_per_block=lines_per_block,
+                max_chars_per_block=SRT_MAX_CHARS_PER_BLOCK
+            )
+    else:
+        # New translation: group normally
+        if log_callback:
+            log_callback("srt_grouping", f"Grouping {len(subtitles)} subtitles into blocks...")
+        lines_per_block = SRT_LINES_PER_BLOCK
+        subtitle_blocks = srt_processor.group_subtitles_for_translation(
+            subtitles,
+            lines_per_block=lines_per_block,
+            max_chars_per_block=SRT_MAX_CHARS_PER_BLOCK
+        )
+
+    # Save the blocks structure for potential resume (for new translations only)
+    if checkpoint_manager and translation_id and not is_resume:
+        import json
+        job = checkpoint_manager.get_job(translation_id)
+        if job:
+            config = job['config']
+            config['saved_subtitle_blocks'] = json.dumps(subtitle_blocks)
+            checkpoint_manager.update_job_config(translation_id, config)
+            if log_callback:
+                log_callback("srt_save_blocks_structure", f"💾 Saved block structure for resume capability")
     
     if log_callback:
         log_callback("srt_translation_start", 
                     f"Translating {len(subtitles)} subtitles in {len(subtitle_blocks)} blocks from {source_language} to {target_language}...")
     
+    # Extract refinement settings from prompt_options if available
+    enable_post_processing = prompt_options.get('refine', False) if prompt_options else False
+    post_processing_instructions = prompt_options.get('refinement_instructions', '') if prompt_options else ''
+
     translations = await translate_subtitles_in_blocks(
         subtitle_blocks,
         source_language,
         target_language,
         model_name,
-        cli_api_endpoint,
-        progress_callback=progress_callback,
-        log_callback=log_callback,
+        cli_api_endpointlog_callback=log_callback,
         stats_callback=stats_callback,
         check_interruption_callback=check_interruption_callback,
         llm_provider=llm_provider,
         gemini_api_key=gemini_api_key,
         openai_api_key=openai_api_key,
         openrouter_api_key=openrouter_api_key,
+        enable_post_processing=enable_post_processing,
+        post_processing_instructions=post_processing_instructions,
         checkpoint_manager=checkpoint_manager,
         translation_id=translation_id,
-        resume_from_block_index=resume_from_block_index
+        resume_from_block_index=resume_from_block_index,
+        prompt_options=prompt_options
     )
     
     # Update subtitles with translations
@@ -412,23 +485,24 @@ async def translate_srt_file_with_callbacks(input_filepath, output_filepath,
             log_callback("srt_save_error", err_msg)
         else:
             print(err_msg)
-    
-    if progress_callback:
-        progress_callback(100)
-
 
 async def translate_file(input_filepath, output_filepath,
                         source_language="English", target_language="Chinese",
-                        model_name=DEFAULT_MODEL, chunk_target_size_cli=MAIN_LINES_PER_CHUNK,
+                        model_name=DEFAULT_MODEL,
                         cli_api_endpoint=API_ENDPOINT,
-                        progress_callback=None, log_callback=None, stats_callback=None,
+                        log_callback=None, stats_callback=None,
                         check_interruption_callback=None,
                         llm_provider="ollama", gemini_api_key=None, openai_api_key=None,
                         openrouter_api_key=None,
                         context_window=2048, auto_adjust_context=True, min_chunk_size=5,
-                        fast_mode=False, prompt_options=None):
+                        prompt_options=None):
     """
     Translate a file (auto-detect format)
+
+    .. deprecated:: Phase 6
+        This function is deprecated and will be removed in a future version.
+        Use :func:`src.core.adapters.translate_file` instead, which provides
+        a unified interface with better architecture and checkpoint support.
 
     Args:
         input_filepath (str): Path to input file
@@ -436,14 +510,20 @@ async def translate_file(input_filepath, output_filepath,
         source_language (str): Source language
         target_language (str): Target language
         model_name (str): LLM model name
-        chunk_target_size_cli (int): Target chunk size
-        cli_api_endpoint (str): API endpoint
-        progress_callback (callable): Progress callback
-        log_callback (callable): Logging callback
+        cli_api_endpoint (str): API endpoint        log_callback (callable): Logging callback
         stats_callback (callable): Statistics callback
         check_interruption_callback (callable): Interruption check callback
         prompt_options (dict): Optional prompt customization options
     """
+    # Issue deprecation warning
+    import warnings
+    warnings.warn(
+        "translate_file (from file_utils) is deprecated and will be removed in a future version. "
+        "Use src.core.adapters.translate_file instead.",
+        DeprecationWarning,
+        stacklevel=2
+    )
+
     if prompt_options is None:
         prompt_options = {}
     _, ext = os.path.splitext(input_filepath.lower())
@@ -451,23 +531,20 @@ async def translate_file(input_filepath, output_filepath,
     if ext == '.epub':
         await translate_epub_file(input_filepath, output_filepath,
                                   source_language, target_language,
-                                  model_name, chunk_target_size_cli,
-                                  cli_api_endpoint,
-                                  progress_callback, log_callback, stats_callback,
+                                  model_name,
+                                  cli_api_endpoint, log_callback, stats_callback,
                                   check_interruption_callback=check_interruption_callback,
                                   llm_provider=llm_provider,
                                   gemini_api_key=gemini_api_key,
                                   openai_api_key=openai_api_key,
                                   openrouter_api_key=openrouter_api_key,
-                                  fast_mode=fast_mode,
                                   prompt_options=prompt_options)
     elif ext == '.srt':
         await translate_srt_file_with_callbacks(
             input_filepath, output_filepath,
             source_language, target_language,
-            model_name, chunk_target_size_cli,
-            cli_api_endpoint,
-            progress_callback, log_callback, stats_callback,
+            model_name,
+            cli_api_endpoint, log_callback, stats_callback,
             check_interruption_callback=check_interruption_callback,
             llm_provider=llm_provider,
             gemini_api_key=gemini_api_key,
@@ -476,13 +553,12 @@ async def translate_file(input_filepath, output_filepath,
             prompt_options=prompt_options
         )
     else:
-        # For .txt files, always use fast mode (no placeholder preservation needed)
+        # Plain text files
         await translate_text_file_with_callbacks(
             input_filepath, output_filepath,
             source_language, target_language,
-            model_name, chunk_target_size_cli,
-            cli_api_endpoint,
-            progress_callback, log_callback, stats_callback,
+            model_name,
+            cli_api_endpoint, log_callback, stats_callback,
             check_interruption_callback=check_interruption_callback,
             llm_provider=llm_provider,
             gemini_api_key=gemini_api_key,
@@ -491,7 +567,6 @@ async def translate_file(input_filepath, output_filepath,
             context_window=context_window,
             auto_adjust_context=auto_adjust_context,
             min_chunk_size=min_chunk_size,
-            fast_mode=True,
             prompt_options=prompt_options
         )
 
@@ -595,7 +670,7 @@ async def generate_tts_for_translation(
     target_language: str,
     tts_config: 'TTSConfig',
     log_callback: Optional[Callable] = None,
-    progress_callback: Optional[Callable] = None
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> Tuple[bool, str, Optional[str]]:
     """
     Generate TTS audio from a translated file.
@@ -608,8 +683,6 @@ async def generate_tts_for_translation(
         target_language: Target language (for voice selection)
         tts_config: TTS configuration object
         log_callback: Optional logging callback
-        progress_callback: Optional progress callback
-
     Returns:
         Tuple of (success: bool, message: str, audio_path: Optional[str])
     """
@@ -648,8 +721,7 @@ async def generate_tts_for_translation(
         def tts_progress(current, total, message):
             if log_callback:
                 log_callback("tts_progress", f"TTS: {message} ({current}/{total})")
-            if progress_callback:
-                # Pass all arguments to the callback
+            if progress_callback:  # Pass all arguments to the callback
                 progress_callback(current, total, message)
 
         # Generate audio
