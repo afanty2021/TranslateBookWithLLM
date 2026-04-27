@@ -14,7 +14,8 @@ from src.config import (
     MISTRAL_API_KEY, MISTRAL_MODEL, MISTRAL_API_ENDPOINT,
     DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_API_ENDPOINT,
     POE_API_KEY, POE_MODEL, POE_API_ENDPOINT,
-    NIM_API_KEY, NIM_MODEL, NIM_API_ENDPOINT
+    NIM_API_KEY, NIM_MODEL, NIM_API_ENDPOINT,
+    MLX_API_KEY, MLX_MODEL, MLX_API_ENDPOINT
 )
 from .base import LLMProvider
 from .providers.ollama import OllamaProvider
@@ -24,6 +25,7 @@ from .providers.openrouter import OpenRouterProvider
 from .providers.mistral import MistralProvider
 from .providers.deepseek import DeepSeekProvider
 from .providers.poe import PoeProvider
+from .providers.mlx import MLXProvider
 
 
 def create_llm_provider(provider_type: str = "ollama", **kwargs) -> LLMProvider:
@@ -34,7 +36,7 @@ def create_llm_provider(provider_type: str = "ollama", **kwargs) -> LLMProvider:
     automatically switches to Gemini provider.
 
     Args:
-        provider_type: Type of provider ("ollama", "openai", "gemini", "openrouter", "mistral", "deepseek", "poe")
+        provider_type: Type of provider ("ollama", "openai", "gemini", "openrouter", "mistral", "deepseek", "poe", "nim", "mlx")
         **kwargs: Provider-specific parameters:
             - api_endpoint: API endpoint URL (Ollama, OpenAI)
             - model: Model name/identifier
@@ -150,6 +152,18 @@ def create_llm_provider(provider_type: str = "ollama", **kwargs) -> LLMProvider:
             api_key=api_key,
             model=kwargs.get("model", NIM_MODEL),
             api_endpoint=kwargs.get("api_endpoint", NIM_API_ENDPOINT)
+        )
+    elif provider_type.lower() == "mlx":
+        # MLX (Apple Silicon) - Special provider for TranslateGemma format
+        # MLX provides high-performance local inference on Apple Silicon
+        api_key = kwargs.get("api_key") or kwargs.get("mlx_api_key")
+        api_endpoint = kwargs.get("api_endpoint", MLX_API_ENDPOINT)
+        return MLXProvider(
+            api_key=api_key or MLX_API_KEY,  # API key may be optional for local MLX
+            model=kwargs.get("model", MLX_MODEL),
+            api_endpoint=api_endpoint,
+            context_window=kwargs.get("context_window") or OLLAMA_NUM_CTX,
+            log_callback=kwargs.get("log_callback")
         )
 
     else:

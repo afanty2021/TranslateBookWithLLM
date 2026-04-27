@@ -45,10 +45,15 @@ class TranslationMetrics:
     # === Retry & Error Tracking ===
     retry_attempts: int = 0  # Total number of retry attempts made
     placeholder_errors: int = 0  # Total placeholder validation errors encountered
+    quality_issues: int = 0  # Total quality validation issues detected
 
     # === Phase 2: Token Alignment Fallback ===
     token_alignment_used: int = 0  # Phase 2: Token alignment fallback used
     token_alignment_success: int = 0  # Phase 2: Token alignment succeeded
+
+    # === Phase 4: Quality Retry ===
+    quality_retry_used: int = 0  # Phase 4: Quality retry attempts
+    quality_retry_success: int = 0  # Phase 4: Quality retry succeeded
 
     # === LLM Correction (legacy, kept for compatibility) ===
     correction_attempts: int = 0  # Total LLM correction attempts made
@@ -197,8 +202,11 @@ class TranslationMetrics:
             "failed_chunks": self.failed_chunks,
             "retry_attempts": self.retry_attempts,
             "placeholder_errors": self.placeholder_errors,
+            "quality_issues": self.quality_issues,
             "token_alignment_used": self.token_alignment_used,
             "token_alignment_success": self.token_alignment_success,
+            "quality_retry_used": self.quality_retry_used,
+            "quality_retry_success": self.quality_retry_success,
             "correction_attempts": self.correction_attempts,
             "correction_success": self.correction_success,
             "total_time_seconds": self.total_time_seconds,
@@ -244,10 +252,15 @@ class TranslationMetrics:
         # Retry & error tracking
         metrics.retry_attempts = data.get("retry_attempts", 0)
         metrics.placeholder_errors = data.get("placeholder_errors", 0)
+        metrics.quality_issues = data.get("quality_issues", 0)
 
         # Phase 2: Token alignment
         metrics.token_alignment_used = data.get("token_alignment_used", 0)
         metrics.token_alignment_success = data.get("token_alignment_success", 0)
+
+        # Phase 4: Quality retry
+        metrics.quality_retry_used = data.get("quality_retry_used", 0)
+        metrics.quality_retry_success = data.get("quality_retry_success", 0)
 
         # LLM correction
         metrics.correction_attempts = data.get("correction_attempts", 0)
@@ -325,6 +338,23 @@ class TranslationMetrics:
             ])
             if self.correction_attempts > 0:
                 summary_lines.append(f"LLM correction attempts: {self.correction_attempts} (success: {self.correction_success})")
+
+        # Quality issue tracking
+        if self.quality_issues > 0:
+            summary_lines.extend([
+                "",
+                "=== Translation Quality Issues ===",
+                f"Quality validation issues: {self.quality_issues} ({self._pct(self.quality_issues)}%)",
+            ])
+
+        # Phase 4: Quality retry tracking
+        if hasattr(self, 'quality_retry_used') and self.quality_retry_used > 0:
+            summary_lines.extend([
+                "",
+                "=== Phase 4: Quality Retry ===",
+                f"Quality retry attempts: {self.quality_retry_used} ({self._pct(self.quality_retry_used)}%)",
+                f"Quality retry success: {self.quality_retry_success}/{self.quality_retry_used} ({self._pct_of(self.quality_retry_success, self.quality_retry_used)}%)",
+            ])
 
         # Timing info (if finalized)
         if self.total_time_seconds > 0:
@@ -412,8 +442,11 @@ class TranslationMetrics:
         self.failed_chunks += other.failed_chunks
         self.retry_attempts += other.retry_attempts
         self.placeholder_errors += other.placeholder_errors
+        self.quality_issues += other.quality_issues
         self.token_alignment_used += other.token_alignment_used
         self.token_alignment_success += other.token_alignment_success
+        self.quality_retry_used += other.quality_retry_used
+        self.quality_retry_success += other.quality_retry_success
         self.correction_attempts += other.correction_attempts
         self.correction_success += other.correction_success
         self.total_tokens_processed += other.total_tokens_processed

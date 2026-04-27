@@ -181,7 +181,7 @@ MIN_CHUNK_SIZE_TOKENS = 50
 """Taille minimale d'un chunk pour éviter la sur-fragmentation"""
 
 # LLM Provider configuration
-LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')  # 'ollama', 'gemini', 'openai', 'openrouter', 'mistral', 'deepseek', or 'poe'
+LLM_PROVIDER = os.getenv('LLM_PROVIDER', 'ollama')  # 'ollama', 'gemini', 'openai', 'openrouter', 'mistral', 'deepseek', 'poe', 'nim', or 'mlx'
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY', '')
 GEMINI_MODEL = os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
@@ -209,6 +209,13 @@ POE_API_ENDPOINT = os.getenv('POE_API_ENDPOINT', 'https://api.poe.com/v1/chat/co
 NIM_API_KEY = os.getenv('NIM_API_KEY', '')
 NIM_MODEL = os.getenv('NIM_MODEL', 'meta/llama-3.1-8b-instruct')
 NIM_API_ENDPOINT = os.getenv('NIM_API_ENDPOINT', 'https://integrate.api.nvidia.com/v1/chat/completions')
+
+# MLX configuration (Apple Silicon MLX framework - OpenAI compatible)
+# MLX provides high-performance local inference on Apple Silicon using Metal acceleration
+# Use with mlx_lm.server or other MLX-based inference servers
+MLX_API_KEY = os.getenv('MLX_API_KEY', '')
+MLX_MODEL = os.getenv('MLX_MODEL', 'mlx-community/translategemma-12b-it-4bit')
+MLX_API_ENDPOINT = os.getenv('MLX_API_ENDPOINT', 'http://localhost:8080/v1/chat/completions')
 
 # SRT-specific configuration
 SRT_LINES_PER_BLOCK = int(os.getenv('SRT_LINES_PER_BLOCK', '5'))
@@ -454,6 +461,7 @@ class TranslationConfig:
     deepseek_api_key: str = DEEPSEEK_API_KEY
     poe_api_key: str = POE_API_KEY
     nim_api_key: str = NIM_API_KEY
+    mlx_api_key: str = os.getenv('MLX_API_KEY', '')
 
     # LLM parameters
     timeout: int = REQUEST_TIMEOUT
@@ -493,6 +501,7 @@ class TranslationConfig:
             deepseek_api_key=getattr(args, 'deepseek_api_key', DEEPSEEK_API_KEY),
             poe_api_key=getattr(args, 'poe_api_key', POE_API_KEY),
             nim_api_key=getattr(args, 'nim_api_key', NIM_API_KEY),
+            mlx_api_key=getattr(args, 'mlx_api_key', os.getenv('MLX_API_KEY', '')),
             max_tokens_per_chunk=getattr(args, 'max_tokens_per_chunk', MAX_TOKENS_PER_CHUNK),
             soft_limit_ratio=getattr(args, 'soft_limit_ratio', SOFT_LIMIT_RATIO)
         )
@@ -522,6 +531,7 @@ class TranslationConfig:
             deepseek_api_key=request_data.get('deepseek_api_key', DEEPSEEK_API_KEY),
             poe_api_key=request_data.get('poe_api_key', POE_API_KEY),
             nim_api_key=request_data.get('nim_api_key', NIM_API_KEY),
+            mlx_api_key=request_data.get('mlx_api_key', os.getenv('MLX_API_KEY', '')),
             max_tokens_per_chunk=request_data.get('max_tokens_per_chunk', MAX_TOKENS_PER_CHUNK),
             soft_limit_ratio=request_data.get('soft_limit_ratio', SOFT_LIMIT_RATIO)
         )
@@ -545,6 +555,7 @@ class TranslationConfig:
             'deepseek_api_key': self.deepseek_api_key,
             'poe_api_key': self.poe_api_key,
             'nim_api_key': self.nim_api_key,
+            'mlx_api_key': self.mlx_api_key,
             'max_tokens_per_chunk': self.max_tokens_per_chunk,
             'soft_limit_ratio': self.soft_limit_ratio
         }

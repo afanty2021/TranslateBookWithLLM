@@ -757,3 +757,176 @@ def generate_post_processing_prompt(
         placeholder_format=placeholder_format,
         additional_instructions=additional_instructions
     )
+
+
+# ============================================================================
+# TRANSLATEGEMMA-SPECIFIC PROMPTS
+# ============================================================================
+
+def generate_translategemma_prompt(
+    main_content: str,
+    source_language: str = "English",
+    target_language: str = "Chinese",
+    context_before: str = "",
+    context_after: str = "",
+    previous_translation_context: str = "",
+    has_placeholders: bool = False,
+    placeholder_format: Optional[Tuple[str, str]] = None
+) -> PromptPair:
+    """
+    Generate translation prompt optimized for Google TranslateGemma models.
+
+    TranslateGemma uses a special input format:
+    <<<source>>>English<<<target>>>Chinese<<<text>>>Hello world
+
+    This function creates prompts that leverage TranslateGemma's specialized
+    translation architecture for optimal quality.
+
+    Args:
+        main_content: The text to translate
+        source_language: Source language name
+        target_language: Target language name
+        context_before: Text appearing before main_content for context
+        context_after: Text appearing after main_content for context
+        previous_translation_context: Previously translated text for consistency
+        has_placeholders: If True, includes placeholder preservation instructions
+        placeholder_format: Optional tuple of (prefix, suffix) for placeholders
+
+    Returns:
+        PromptPair: A named tuple with 'system' and 'user' prompts
+    """
+    # Build placeholder preservation section if needed
+    if has_placeholders:
+        placeholder_section = build_placeholder_section(source_language, target_language, placeholder_format)
+    else:
+        placeholder_section = ""
+
+    # Build context block
+    context_blocks = []
+    if context_before and context_before.strip():
+        context_blocks.append(f"# Previous Context:\n{context_before}\n")
+    if context_after and context_after.strip():
+        context_blocks.append(f"# Following Context:\n{context_after}\n")
+    if previous_translation_context and previous_translation_context.strip():
+        context_blocks.append(f"# Previous Translation:\n{previous_translation_context}\n")
+
+    context_text = "\n".join(context_blocks) if context_blocks else ""
+
+    # SYSTEM PROMPT - TranslateGemma optimized
+    system_prompt = f"""You are a professional {target_language} translator specializing in high-quality literary and technical translation.
+
+# TRANSLATION GUIDELINES
+
+## Core Principles
+1. **Accuracy First**: Preserve all meaning, details, and nuances from the original text
+2. **Natural Flow**: Use idiomatic {target_language} that sounds natural to native speakers
+3. **Cultural Adaptation**: Adapt cultural references appropriately for {target_language} readers
+4. **Consistency**: Maintain consistent terminology and style throughout the translation
+
+## Quality Standards
+- **Tone**: Match the original tone (formal, casual, academic, conversational, etc.)
+- **Register**: Preserve the level of formality from the source text
+- **Clarity**: Ensure the translation is clear and unambiguous in {target_language}
+- **Readability**: The text should flow naturally and be pleasant to read
+
+## Special Instructions
+{placeholder_section}
+
+## Output Format
+Provide ONLY the translated text without any explanations, notes, or meta-commentary.
+The translation should be ready to use as-is."""
+
+    # USER PROMPT - TranslateGemma format
+    # TranslateGemma expects: <<<source>>>Language<<<target>>>Language<<<text>>>Content
+    user_prompt = f"""{context_text}# Translation Task
+
+Translate the following text from {source_language} to {target_language}:
+
+<<<source>>>{source_language}<<<target>>>{target_language}<<<text>>>{main_content}
+
+Provide your translation now:"""
+
+    return PromptPair(system=system_prompt.strip(), user=user_prompt.strip())
+
+
+def generate_translategemma_refinement_prompt(
+    draft_translation: str,
+    source_language: str = "English",
+    target_language: str = "Chinese",
+    context_before: str = "",
+    context_after: str = "",
+    has_placeholders: bool = False,
+    placeholder_format: Optional[Tuple[str, str]] = None
+) -> PromptPair:
+    """
+    Generate a refinement prompt optimized for TranslateGemma models.
+
+    This polishes a first-pass translation to improve literary quality,
+    natural flow, and stylistic excellence.
+
+    Args:
+        draft_translation: The first-pass translation to refine
+        source_language: Original source language (for reference)
+        target_language: Target language name
+        context_before: Previously refined text for context
+        context_after: Text appearing after for context
+        has_placeholders: If True, includes placeholder preservation instructions
+        placeholder_format: Optional tuple of (prefix, suffix) for placeholders
+
+    Returns:
+        PromptPair: A named tuple with 'system' and 'user' prompts
+    """
+    if has_placeholders:
+        placeholder_section = build_placeholder_section(source_language, target_language, placeholder_format)
+    else:
+        placeholder_section = ""
+
+    # Build context block
+    context_blocks = []
+    if context_before and context_before.strip():
+        context_blocks.append(f"# Previous Context:\n{context_before}\n")
+    if context_after and context_after.strip():
+        context_blocks.append(f"# Following Context:\n{context_after}\n")
+
+    context_text = "\n".join(context_blocks) if context_blocks else ""
+
+    # SYSTEM PROMPT
+    system_prompt = f"""You are an expert {target_language} editor specializing in literary refinement and stylistic improvement.
+
+# REFINEMENT GUIDELINES
+
+## Core Principles
+1. **Enhance Flow**: Improve sentence structure and paragraph transitions for better readability
+2. **Elevate Style**: Replace awkward phrasing with elegant, natural {target_language} expressions
+3. **Fix Issues**: Correct any grammatical, spelling, or punctuation errors
+4. **Maintain Meaning**: Preserve all original meaning and nuances
+
+## What to Improve
+- **Literal translations** → Natural {target_language} expressions
+- **Repetitive vocabulary** → Varied, rich word choices
+- **Awkward phrasing** → Smooth, idiomatic {target_language}
+- **Passive voice** (where appropriate) → Active, engaging constructions
+- **Weak transitions** → Smooth paragraph and sentence connections
+
+## What to Preserve
+- All factual content and meaning
+- Character names and proper nouns
+- Technical terms and domain-specific vocabulary
+- Original tone and intent
+{placeholder_section}
+
+## Output Format
+Provide ONLY the refined translation without any explanations or meta-commentary."""
+
+    # USER PROMPT
+    user_prompt = f"""{context_text}# Refinement Task
+
+The following {target_language} translation needs refinement to improve its literary quality and natural flow:
+
+<<<source>>>{target_language}<<<target>>>{target_language}<<<text>>>{draft_translation}
+
+Please refine this translation to make it more elegant and natural while preserving its meaning.
+
+Provide your refined version now:"""
+
+    return PromptPair(system=system_prompt.strip(), user=user_prompt.strip())

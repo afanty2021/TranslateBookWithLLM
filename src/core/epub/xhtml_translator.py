@@ -397,15 +397,20 @@ async def translate_chunk_with_fallback(
     max_retries: int = 1,
     context_manager: Optional[AdaptiveContextManager] = None,
     placeholder_format: Optional[Tuple[str, str]] = None,
-    prompt_options: Optional[Dict] = None
+    prompt_options: Optional[Dict] = None,
+    quality_validator: Optional[Any] = None,
+    enable_quality_retry: bool = True,
+    max_quality_retries: int = 1
 ) -> str:
     """
     Translate a chunk with retry mechanism.
 
     Translation flow:
     1. Phase 1: Normal translation (up to max_retries attempts)
-    2. Phase 2: Return untranslated text if all retries fail
-    3. Restore global indices
+    2. Phase 2: Token alignment fallback
+    3. Phase 3: Return untranslated text if all fails
+    4. Phase 4: Quality retry (if enabled and quality validation fails)
+    5. Restore global indices
 
     Args:
         chunk_text: Text with local placeholders (0, 1, 2...)
@@ -420,6 +425,9 @@ async def translate_chunk_with_fallback(
         max_retries: Maximum translation retry attempts (default from config)
         context_manager: Optional AdaptiveContextManager for handling context overflow
         prompt_options: Optional prompt customization options (custom instructions, etc.)
+        quality_validator: Optional TranslationQualityValidator for quality checks
+        enable_quality_retry: Enable Phase 4 quality retry (default: True)
+        max_quality_retries: Maximum quality retry attempts (default: 1)
 
     Returns:
         Translated text with global placeholders restored
@@ -430,8 +438,19 @@ async def translate_chunk_with_fallback(
     # Initialize placeholder manager
     placeholder_mgr = PlaceholderManager()
 
+    # Extract clean text for quality validation
+    from src.common.placeholder_format import PlaceholderFormat
+    fmt = PlaceholderFormat.from_config()
+    clean_original = fmt.remove_all(chunk_text)
+
     # Calculate if this chunk has placeholders
     has_placeholders = len(local_tag_map) > 0
+
+    # Track the best result across all phases
+    best_result = None
+    best_quality_issues = []  # Track issues for the best result
+    quality_failed = False  # Track if any quality check failed
+    skip_phase_3 = False  # Track if we should skip Phase 3
 
     # ==========================================================================
     # PHASE 1: Normal translation with retries
@@ -477,9 +496,65 @@ async def translate_chunk_with_fallback(
                 if log_callback:
                     log_callback("retry_success", f"✓ Translation succeeded after {attempt + 1} attempt(s)")
 
-            result = placeholder_mgr.restore_to_global(translated, global_indices)
-            stats.record_processed()  # Mark chunk as fully processed
-            return result
+            # Quality validation (if validator provided)
+            current_quality_passed = True
+            current_issues = []
+
+            if quality_validator is not None:
+                # Extract clean translated text for validation
+                clean_translated = fmt.remove_all(translated)
+                is_valid, issues = quality_validator.validate_translation(
+                    original_text=clean_original,
+                    translated_text=clean_translated
+                )
+
+                current_issues = issues
+                if not is_valid:
+                    current_quality_passed = False
+                    quality_failed = True
+                    stats.quality_issues += 1
+                    if log_callback:
+                        issue_summary = ", ".join([f"{issue.issue_type}({issue.severity})" for issue in issues])
+                        log_callback("quality_warning", f"⚠️ Translation quality issues detected: {issue_summary}")
+
+                        # Log detailed issues
+                        for issue in issues:
+                            if issue.severity == 'error':
+                                log_callback("quality_error", f"  ✗ {issue.message}")
+                            elif issue.severity == 'warning':
+                                log_callback("quality_warning_detail", f"  ⚠ {issue.message}")
+                else:
+                    if log_callback:
+                        log_callback("quality_ok", "✓ Translation quality validation passed")
+
+            # Store this as a candidate result
+            candidate_result = placeholder_mgr.restore_to_global(translated, global_indices)
+
+            # Update best result if this one is better
+            if best_result is None or current_quality_passed:
+                # Prefer results that pass quality validation
+                best_result = candidate_result
+                best_quality_issues = current_issues
+                if current_quality_passed and log_callback:
+                    log_callback("best_result", "✓ This result is the best so far")
+
+            # If quality passed, we can use this result (but continue to Phase 2 for potential improvement)
+            if current_quality_passed:
+                # Keep this as the best result and continue
+                if log_callback:
+                    log_callback("phase1_continue", "Phase 1 successful with quality passed, continuing to Phase 2 for potential improvement")
+                break  # Exit retry loop, continue to Phase 2
+            else:
+                # Quality failed, continue to next retry or Phase 2
+                if log_callback:
+                    log_callback("phase1_quality_failed", "Phase 1 quality check failed, trying next retry or Phase 2")
+                if attempt < max_retries - 1:
+                    continue  # Try next retry
+                else:
+                    # No more retries, continue to Phase 2
+                    if log_callback:
+                        log_callback("phase1_to_phase2", "No more retries, continuing to Phase 2")
+                    break
         else:
             # Track placeholder error
             stats.placeholder_errors += 1
@@ -547,10 +622,59 @@ async def translate_chunk_with_fallback(
                     log_callback("phase2_success", f"✓ Phase 2 successful: Token alignment repositioned {len(placeholders_list)} tags")
                     log_callback("phase2_warning", "⚠️ Note: Proportional repositioning may cause minor layout imperfections")
 
-                # 6. Restore global indices and return
-                result = placeholder_mgr.restore_to_global(result_with_placeholders, global_indices)
-                stats.record_processed()  # Mark chunk as fully processed
-                return result
+                # 6. Quality validation (if validator provided)
+                current_quality_passed = True
+                current_issues = []
+
+                if quality_validator is not None:
+                    # Extract clean translated text for validation
+                    clean_translated = fmt.remove_all(result_with_placeholders)
+                    is_valid, issues = quality_validator.validate_translation(
+                        original_text=clean_original,
+                        translated_text=clean_translated
+                    )
+
+                    current_issues = issues
+                    if not is_valid:
+                        current_quality_passed = False
+                        quality_failed = True
+                        stats.quality_issues += 1
+                        if log_callback:
+                            issue_summary = ", ".join([f"{issue.issue_type}({issue.severity})" for issue in issues])
+                            log_callback("quality_warning", f"⚠️ Translation quality issues detected: {issue_summary}")
+
+                            # Log detailed issues
+                            for issue in issues:
+                                if issue.severity == 'error':
+                                    log_callback("quality_error", f"  ✗ {issue.message}")
+                                elif issue.severity == 'warning':
+                                    log_callback("quality_warning_detail", f"  ⚠ {issue.message}")
+
+                    else:
+                        if log_callback:
+                            log_callback("quality_ok", "✓ Translation quality validation passed")
+
+                # 7. Store this as a candidate result
+                candidate_result = placeholder_mgr.restore_to_global(result_with_placeholders, global_indices)
+
+                # Update best result if this one is better
+                if best_result is None or current_quality_passed:
+                    # Prefer results that pass quality validation
+                    best_result = candidate_result
+                    best_quality_issues = current_issues
+                    if current_quality_passed and log_callback:
+                        log_callback("best_result", "✓ Phase 2 result is the best so far")
+
+                # If quality passed, we can use this result
+                if current_quality_passed:
+                    # Keep this as the best result and skip Phase 3
+                    if log_callback:
+                        log_callback("phase2_success_skip_phase3", "Phase 2 successful with quality passed, skipping Phase 3")
+                    skip_phase_3 = True
+                else:
+                    # Quality failed, continue to Phase 3
+                    if log_callback:
+                        log_callback("phase2_quality_failed", "Phase 2 quality check failed, continuing to Phase 3")
             else:
                 _log_error(log_callback, "phase2_validation_failed", "✗ Phase 2 validation failed")
 
@@ -558,20 +682,139 @@ async def translate_chunk_with_fallback(
             _log_error(log_callback, "phase2_error", f"✗ Phase 2 error: {str(e)}")
 
     # ==========================================================================
-    # PHASE 3: UNTRANSLATED FALLBACK
+    # PHASE 3: UNTRANSLATED FALLBACK (only if Phase 2 didn't succeed with quality)
     # ==========================================================================
-    stats.fallback_used += 1
+    if not skip_phase_3:
+        stats.fallback_used += 1
 
     _log_error(log_callback, "fallback_untranslated",
-        "✗ Phase 3: All translation attempts failed - returning original untranslated text")
+        "✗ Phase 3: All translation attempts failed - using original untranslated text as fallback")
 
     if log_callback:
-        log_callback("phase3_warning", "⚠️ This chunk will remain in the source language")
+        log_callback("phase3_warning", "⚠️ This chunk will remain in the source language (for now)")
 
-    # Return the original chunk_text with global indices restored
-    result_final = placeholder_mgr.restore_to_global(chunk_text, global_indices)
-    stats.record_processed()  # Mark chunk as fully processed (even on failure)
-    return result_final
+    # Store the untranslated text as a fallback result
+    if best_result is None:
+        best_result = placeholder_mgr.restore_to_global(chunk_text, global_indices)
+        if log_callback:
+            log_callback("phase3_fallback", "Using untranslated text as fallback result")
+
+    # ==========================================================================
+    # PHASE 4: QUALITY RETRY (if enabled and quality failed)
+    # ==========================================================================
+    if enable_quality_retry and quality_failed and quality_validator is not None and max_quality_retries > 0:
+        stats.quality_retry_used = getattr(stats, 'quality_retry_used', 0) + 1
+
+        if log_callback:
+            log_callback("phase4_start", f"🔄 Phase 4: Quality retry activated (attempt 1/{max_quality_retries})")
+            log_callback("phase4_info", "Using enhanced translation strategy for better quality")
+
+        # Create enhanced prompt options for quality retry
+        enhanced_prompt_options = prompt_options.copy() if prompt_options else {}
+        enhanced_prompt_options['custom_instructions'] = (
+            "CRITICAL QUALITY REQUIREMENTS:\n"
+            f"1. Translate EVERYTHING into {target_language}\n"
+            f"2. DO NOT keep any text in the original language ({source_language})\n"
+            "3. Ensure complete sentence translation - no partial translations\n"
+            "4. Use proper {target_language} grammar and vocabulary\n"
+            "5. Translate all proper names and technical terms appropriately\n"
+            "6. Maintain the exact same meaning as the original text\n"
+            "7. Do NOT abbreviate or summarize - translate completely\n"
+        )
+
+        # Try quality retry with enhanced prompts
+        for retry_attempt in range(max_quality_retries):
+            if log_callback and retry_attempt > 0:
+                log_callback("phase4_retry", f"🔄 Phase 4 retry attempt {retry_attempt + 1}/{max_quality_retries}")
+
+            try:
+                # Translate with enhanced prompts
+                retry_translated = await generate_translation_request(
+                    chunk_text,
+                    context_before="",
+                    context_after="",
+                    previous_translation_context="",
+                    source_language=source_language,
+                    target_language=target_language,
+                    model=model_name,
+                    llm_client=llm_client,
+                    log_callback=log_callback,
+                    has_placeholders=has_placeholders,
+                    context_manager=context_manager,
+                    placeholder_format=placeholder_format,
+                    prompt_options=enhanced_prompt_options
+                )
+
+                if retry_translated is None:
+                    _log_error(log_callback, "phase4_error", f"✗ Phase 4 attempt {retry_attempt + 1} returned None")
+                    continue
+
+                # Validate placeholders
+                validation_result = validate_placeholders(retry_translated, local_tag_map)
+
+                if validation_result:
+                    # Check quality
+                    clean_retry = fmt.remove_all(retry_translated)
+                    is_valid, issues = quality_validator.validate_translation(
+                        original_text=clean_original,
+                        translated_text=clean_retry
+                    )
+
+                    if is_valid:
+                        # Success! Update best result
+                        stats.quality_retry_success = getattr(stats, 'quality_retry_success', 0) + 1
+                        best_result = placeholder_mgr.restore_to_global(retry_translated, global_indices)
+                        best_quality_issues = []
+
+                        if log_callback:
+                            log_callback("phase4_success", "✓ Phase 4 quality retry successful! Using improved translation.")
+                        break  # Exit retry loop
+                    else:
+                        # Quality still failed, but maybe better than before?
+                        if log_callback:
+                            issue_summary = ", ".join([f"{issue.issue_type}({issue.severity})" for issue in issues])
+                            log_callback("phase4_quality_failed", f"⚠️ Phase 4 quality check still failed: {issue_summary}")
+
+                        # Compare with previous best result
+                        if len(issues) < len(best_quality_issues):
+                            # Fewer issues, use this as new best result
+                            candidate_result = placeholder_mgr.restore_to_global(retry_translated, global_indices)
+                            best_result = candidate_result
+                            best_quality_issues = issues
+                            if log_callback:
+                                log_callback("phase4_improvement", f"✓ Phase 4 result has fewer issues ({len(issues)} vs {len(best_quality_issues)})")
+                else:
+                    # Placeholder validation failed
+                    if log_callback:
+                        log_callback("phase4_placeholder_failed", f"✗ Phase 4 attempt {retry_attempt + 1} placeholder validation failed")
+
+            except Exception as e:
+                _log_error(log_callback, "phase4_exception", f"✗ Phase 4 attempt {retry_attempt + 1} error: {str(e)}")
+
+        # Phase 4 complete
+        if log_callback:
+            if best_result and len(best_quality_issues) == 0:
+                log_callback("phase4_complete", "✓ Phase 4 completed successfully with high quality translation")
+            elif best_result:
+                log_callback("phase4_partial", f"⚠️ Phase 4 completed with {len(best_quality_issues)} remaining issues")
+            else:
+                log_callback("phase4_failed", "✗ Phase 4 completed without improvement")
+
+    # ==========================================================================
+    # FINAL: Return the best result
+    # ==========================================================================
+    if best_result is not None:
+        stats.record_processed()  # Mark chunk as fully processed
+        if log_callback and quality_failed:
+            if len(best_quality_issues) == 0:
+                log_callback("final_success", "✓ Final result: High quality translation achieved")
+            else:
+                log_callback("final_partial", f"⚠️ Final result: {len(best_quality_issues)} quality issues remaining")
+        return best_result
+    else:
+        # This should never happen, but handle it gracefully
+        stats.record_processed()
+        return placeholder_mgr.restore_to_global(chunk_text, global_indices)
 
 
 # === Private Helper Functions ===
@@ -742,6 +985,13 @@ async def _translate_all_chunks_with_checkpoint(
 
     CHECKPOINT_FREQUENCY = 5  # Save every 5 chunks
 
+    # Initialize quality validator
+    from .translation_quality_validator import TranslationQualityValidator
+    quality_validator = TranslationQualityValidator(
+        source_language=source_language,
+        target_language=target_language
+    )
+
     # Initialize if first time
     if stats is None:
         stats = TranslationMetrics()
@@ -824,7 +1074,8 @@ async def _translate_all_chunks_with_checkpoint(
             max_retries=max_retries,
             context_manager=context_manager,
             placeholder_format=placeholder_format,
-            prompt_options=prompt_options
+            prompt_options=prompt_options,
+            quality_validator=quality_validator
         )
         translated_chunks.append(translated)
 
@@ -922,6 +1173,13 @@ async def _translate_all_chunks(
     Returns:
         Tuple of (translated_chunks, statistics)
     """
+    # Initialize quality validator
+    from .translation_quality_validator import TranslationQualityValidator
+    quality_validator = TranslationQualityValidator(
+        source_language=source_language,
+        target_language=target_language
+    )
+
     stats = TranslationMetrics()
     translated_chunks = []
 
@@ -955,7 +1213,8 @@ async def _translate_all_chunks(
             max_retries=max_retries,
             context_manager=context_manager,
             placeholder_format=placeholder_format,
-            prompt_options=prompt_options
+            prompt_options=prompt_options,
+            quality_validator=quality_validator
         )
         translated_chunks.append(translated)
 
