@@ -561,6 +561,13 @@ async def translate_chunk_with_fallback(
             stats.retry_attempts += 1
             # Continue to next retry attempt
 
+    # Check if Phase 1 completely failed (all retries returned None)
+    # This ensures quality_failed is set even if token alignment is disabled
+    if best_result is None and not quality_failed:
+        quality_failed = True
+        if log_callback:
+            log_callback("phase1_complete_failure", "⚠️ Phase 1 completely failed (all retries returned None)")
+
     # ==========================================================================
     # PHASE 2: TOKEN ALIGNMENT FALLBACK
     # ==========================================================================
@@ -680,6 +687,7 @@ async def translate_chunk_with_fallback(
 
         except Exception as e:
             _log_error(log_callback, "phase2_error", f"✗ Phase 2 error: {str(e)}")
+            quality_failed = True  # Mark quality as failed to trigger Phase 4
 
     # ==========================================================================
     # PHASE 3: UNTRANSLATED FALLBACK (only if Phase 2 didn't succeed with quality)

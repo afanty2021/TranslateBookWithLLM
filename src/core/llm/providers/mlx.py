@@ -40,6 +40,25 @@ class MLXProvider(LLMProvider):
         self.context_window = context_window
         self.log_callback = log_callback
         self._is_translategemma = "translategemma" in model.lower()
+        # MLX provider 使用自己的客户端，避免连接重用问题
+        self._mlx_client = None
+
+    async def _get_mlx_client(self) -> httpx.AsyncClient:
+        """获取或创建 MLX 专用客户端"""
+        if self._mlx_client is None:
+            self._mlx_client = httpx.AsyncClient(
+                limits=httpx.Limits(max_keepalive_connections=2, max_connections=5),
+                timeout=httpx.Timeout(600.0, connect=60.0)
+            )
+        return self._mlx_client
+
+    async def close(self):
+        """关闭 MLX 客户端"""
+        if self._mlx_client:
+            await self._mlx_client.aclose()
+            self._mlx_client = None
+        # 同时关闭基类客户端
+        await super().close()
 
     @staticmethod
     def _normalize_endpoint(endpoint: str) -> str:
@@ -227,16 +246,17 @@ class MLXProvider(LLMProvider):
             "model": self.model,
             "messages": messages,
             "stream": False,
+            "max_tokens": 1024,
         }
 
-        client = await self._get_client()
+        client = await self._get_mlx_client()
+
         for attempt in range(MAX_TRANSLATION_ATTEMPTS):
             try:
                 response = await client.post(
                     self.api_endpoint,
                     json=payload,
-                    headers=headers,
-                    timeout=timeout
+                    headers=headers
                 )
                 response.raise_for_status()
 
