@@ -40,6 +40,7 @@ class MLXProvider(LLMProvider):
         self.context_window = context_window
         self.log_callback = log_callback
         self._is_translategemma = "translategemma" in model.lower()
+        self._is_qwen_thinking = any(k in model.lower() for k in ["qwen3", "qwen3.6", "qwq"])
         # MLX provider 使用自己的客户端，避免连接重用问题
         self._mlx_client = None
 
@@ -185,6 +186,13 @@ class MLXProvider(LLMProvider):
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
+
+            # Qwen 3.x thinking models: add assistant prefill to skip verbose thinking
+            # Without prefill, Qwen generates thousands of reasoning tokens before the answer
+            if self._is_qwen_thinking:
+                from src.config import TRANSLATE_TAG_IN
+                messages.append({"role": "assistant", "content": TRANSLATE_TAG_IN})
+
             return messages
 
     def _language_to_code(self, lang: str) -> str:
@@ -206,6 +214,20 @@ class MLXProvider(LLMProvider):
         lang_lower = lang.lower()
         return lang_map.get(lang_lower, lang_lower)
 
+    def _strip_thinking(self, text: str) -> str:
+        """去除 Qwen thinking 输出，保留翻译内容"""
+        import re
+        # Try to find translation after thinking block
+        patterns = [
+            r'^Thinking Process:.*?\n\n(.*)',
+            r'^<think()>.*?</think()>\s*(.*)',
+        ]
+        for pat in patterns:
+            m = re.match(pat, text, re.DOTALL)
+            if m:
+                return m.group(1).strip()
+        return ""
+
     def _clean_model_artifacts(self, text: str) -> str:
         """清理模型生成的多余标签和产物"""
         if not text:
@@ -219,8 +241,43 @@ class MLXProvider(LLMProvider):
         # 移除其他常见模型产物
         text = re.sub(r'<eos>', '', text)
         text = re.sub(r'<\|im_end\|>', '', text)
+        # 清理 Qwen thinking 输出 (Thinking Process:\n...\n)
+        text = re.sub(r'^Thinking Process:.*?(?=\n[^\s*]|\Z)', '', text, flags=re.DOTALL)
 
         return text.strip()
+
+    def _detect_repetition(self, text: str) -> tuple[bool, str]:
+        """
+        检测 LLM 重复循环并截断。
+
+        Returns:
+            (has_repetition, truncated_text)
+        """
+        if not text or len(text) < 60:
+            return False, text
+
+        # 用滑动窗口检测重复短语
+        # 检查 15-50 字符的子串是否重复 3+ 次
+        window_sizes = [15, 20, 25, 30, 40]
+        for w in window_sizes:
+            if len(text) < w * 3:
+                continue
+            seen = {}
+            for i in range(len(text) - w):
+                substr = text[i:i + w]
+                if substr in seen:
+                    seen[substr].append(i)
+                else:
+                    seen[substr] = [i]
+
+            for substr, positions in seen.items():
+                if len(positions) >= 3:
+                    # 找到重复：在第 2 次出现处截断
+                    cut_pos = positions[1]
+                    truncated = text[:cut_pos].strip()
+                    return True, truncated
+
+        return False, text
 
     async def generate(self, prompt: str, timeout: int = REQUEST_TIMEOUT,
                       system_prompt: Optional[str] = None) -> Optional[LLMResponse]:
@@ -242,11 +299,16 @@ class MLXProvider(LLMProvider):
         # Build messages with appropriate format
         messages = self._build_messages(prompt, system_prompt)
 
+        # Qwen thinking models with prefill need more tokens for translation output
+        max_tokens = 2048 if self._is_qwen_thinking else 1024
+
         payload = {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "max_tokens": 1024,
+            "max_tokens": max_tokens,
+            "repetition_penalty": 1.1 if self._is_qwen_thinking else 1.0,
+            "frequency_penalty": 0.3 if self._is_qwen_thinking else 0.0,
         }
 
         client = await self._get_mlx_client()
@@ -265,6 +327,29 @@ class MLXProvider(LLMProvider):
 
                 # Clean up model-generated artifacts
                 response_text = self._clean_model_artifacts(response_text)
+
+                # Detect Qwen thinking mode leakage — prefill failed, retry
+                if self._is_qwen_thinking and response_text.startswith("Thinking Process:"):
+                    if self.log_callback:
+                        self.log_callback("mlx_thinking_leak",
+                            f"⚠️ Thinking leaked (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), retrying...")
+                    if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    # Last attempt: try to extract any translation after thinking
+                    response_text = self._strip_thinking(response_text)
+
+                # Detect repetition loops — truncate and retry
+                has_rep, fixed_text = self._detect_repetition(response_text)
+                if has_rep:
+                    if self.log_callback:
+                        self.log_callback("mlx_repetition",
+                            f"⚠️ Repetition loop detected (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), retrying...")
+                    if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
+                        await asyncio.sleep(1)
+                        continue
+                    # Last attempt: use truncated text
+                    response_text = fixed_text
 
                 # Extract token usage if available
                 usage = response_json.get("usage", {})
@@ -355,6 +440,10 @@ class MLXProvider(LLMProvider):
         For TranslateGemma models, the response is already the translation
         without any tags, so we return it directly after cleaning.
 
+        For Qwen thinking models with assistant prefill, the response may lack
+        the opening <TRANSLATION> tag (since it was in the prefill). Handle this
+        by prepending the tag before extraction.
+
         For other MLX models, fall back to standard tag extraction.
 
         Args:
@@ -372,6 +461,23 @@ class MLXProvider(LLMProvider):
             cleaned = self._clean_model_artifacts(response)
             if cleaned and cleaned.strip():
                 return cleaned.strip()
+
+        # For Qwen thinking models, assistant prefill contains <TRANSLATION> tag
+        # so the response may only have content + closing tag
+        if self._is_qwen_thinking:
+            from src.config import TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT
+            cleaned = self._clean_model_artifacts(response)
+            # Try standard extraction first
+            result = self._extractor.extract(cleaned)
+            if result:
+                return result
+            # If extraction failed, check if we need to add the opening tag
+            if TRANSLATE_TAG_OUT in cleaned and TRANSLATE_TAG_IN not in cleaned:
+                return self._extractor.extract(TRANSLATE_TAG_IN + cleaned)
+            # No tags at all - return cleaned content directly
+            if cleaned and cleaned.strip():
+                return cleaned.strip()
+            return None
 
         # For other models, use standard tag extraction
         return self._extractor.extract(response)

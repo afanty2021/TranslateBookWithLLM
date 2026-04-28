@@ -272,6 +272,15 @@ For consistency and natural flow, here's what came immediately before:
 
 """
 
+    # Build placeholder reminder for user prompt
+    placeholder_reminder = ""
+    if has_placeholders and "[id" in main_content:
+        from .examples.constants import TAG0 as _PTAG0, TAG1 as _PTAG1
+        placeholder_reminder = f"""
+
+⚠️ PLACEHOLDER RULE: Keep ALL [id0], [id1], [id2]... markers EXACTLY as-is.
+Do NOT remove, reorder, or merge any [idN] markers."""
+
     user_prompt = f"""{previous_translation_block_text}# TEXT TO TRANSLATE
 
 {INPUT_TAG_IN}
@@ -283,7 +292,7 @@ REMINDER: Output ONLY your translation in this exact format:
 your translation here
 {translate_tag_out}
 
-Start with {translate_tag_in} and end with {translate_tag_out}. Nothing before or after.
+Start with {translate_tag_in} and end with {translate_tag_out}. Nothing before or after.{placeholder_reminder}
 
 Provide your translation now:"""
 

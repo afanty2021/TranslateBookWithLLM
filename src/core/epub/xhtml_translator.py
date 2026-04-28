@@ -573,7 +573,7 @@ async def translate_chunk_with_fallback(
     # ==========================================================================
     from src.config import EPUB_TOKEN_ALIGNMENT_ENABLED
 
-    if EPUB_TOKEN_ALIGNMENT_ENABLED:
+    if EPUB_TOKEN_ALIGNMENT_ENABLED and best_result is None:
         try:
             stats.token_alignment_used += 1  # Track Phase 2 usage
             if log_callback:
@@ -695,17 +695,17 @@ async def translate_chunk_with_fallback(
     if not skip_phase_3:
         stats.fallback_used += 1
 
-    _log_error(log_callback, "fallback_untranslated",
-        "✗ Phase 3: All translation attempts failed - using original untranslated text as fallback")
+        _log_error(log_callback, "fallback_untranslated",
+            "✗ Phase 3: All translation attempts failed - using original untranslated text as fallback")
 
-    if log_callback:
-        log_callback("phase3_warning", "⚠️ This chunk will remain in the source language (for now)")
-
-    # Store the untranslated text as a fallback result
-    if best_result is None:
-        best_result = placeholder_mgr.restore_to_global(chunk_text, global_indices)
         if log_callback:
-            log_callback("phase3_fallback", "Using untranslated text as fallback result")
+            log_callback("phase3_warning", "⚠️ This chunk will remain in the source language (for now)")
+
+        # Store the untranslated text as a fallback result
+        if best_result is None:
+            best_result = placeholder_mgr.restore_to_global(chunk_text, global_indices)
+            if log_callback:
+                log_callback("phase3_fallback", "Using untranslated text as fallback result")
 
     # ==========================================================================
     # PHASE 4: QUALITY RETRY (if enabled and quality failed)
