@@ -186,13 +186,6 @@ class MLXProvider(LLMProvider):
             if system_prompt:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
-
-            # Qwen 3.x thinking models: add assistant prefill to skip verbose thinking
-            # Without prefill, Qwen generates thousands of reasoning tokens before the answer
-            if self._is_qwen_thinking:
-                from src.config import TRANSLATE_TAG_IN
-                messages.append({"role": "assistant", "content": TRANSLATE_TAG_IN})
-
             return messages
 
     def _language_to_code(self, lang: str) -> str:
@@ -250,17 +243,19 @@ class MLXProvider(LLMProvider):
         """
         检测 LLM 重复循环并截断。
 
+        调整后的阈值：只检测真正异常的重复循环，避免误判正常翻译。
+
         Returns:
             (has_repetition, truncated_text)
         """
-        if not text or len(text) < 60:
+        if not text or len(text) < 100:
             return False, text
 
         # 用滑动窗口检测重复短语
-        # 检查 15-50 字符的子串是否重复 3+ 次
-        window_sizes = [15, 20, 25, 30, 40]
+        # 调整：更大的窗口（30-80字符），需要重复 5+ 次，且间距很小
+        window_sizes = [30, 40, 50, 60, 80]
         for w in window_sizes:
-            if len(text) < w * 3:
+            if len(text) < w * 5:
                 continue
             seen = {}
             for i in range(len(text) - w):
@@ -271,11 +266,16 @@ class MLXProvider(LLMProvider):
                     seen[substr] = [i]
 
             for substr, positions in seen.items():
-                if len(positions) >= 3:
-                    # 找到重复：在第 2 次出现处截断
-                    cut_pos = positions[1]
-                    truncated = text[:cut_pos].strip()
-                    return True, truncated
+                if len(positions) >= 5:
+                    # 检查重复之间的间距是否很小（真正的循环）
+                    gaps = [positions[i+1] - positions[i] for i in range(len(positions)-1)]
+                    avg_gap = sum(gaps) / len(gaps) if gaps else 0
+                    # 只有当间距很小时（< 200字符）才是真正的循环
+                    if avg_gap < 200:
+                        # 找到重复：在第 2 次出现处截断
+                        cut_pos = positions[1]
+                        truncated = text[:cut_pos].strip()
+                        return True, truncated
 
         return False, text
 
@@ -323,7 +323,17 @@ class MLXProvider(LLMProvider):
                 response.raise_for_status()
 
                 response_json = response.json()
-                response_text = response_json.get("choices", [{}])[0].get("message", {}).get("content", "")
+                message = response_json.get("choices", [{}])[0].get("message", {})
+
+                # 方案 D：检查 reasoning_content 字段（零误判）
+                reasoning_content = message.get("reasoning_content")
+                response_text = message.get("content", "")
+
+                # 如果有 reasoning_content，记录到 thinking 缓存
+                if reasoning_content and self.log_callback:
+                    self.log_callback("mlx_thinking_detected",
+                        f"🧠 Thinking content detected ({len(reasoning_content)} chars)")
+                    # 可以在这里缓存 reasoning_content 用于调试
 
                 # Clean up model-generated artifacts
                 response_text = self._clean_model_artifacts(response_text)
