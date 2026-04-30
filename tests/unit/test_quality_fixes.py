@@ -97,6 +97,20 @@ class TestApiKeySanitization:
         assert d["model"] == "qwen3:14b"
 
 
+class TestNoHardcodedSecrets:
+    _FILES = ['check_poe_models.py', 'test_cleanup.py', 'test_epub_translation.py', 'test_simple_api.py']
+    _PATTERNS = ['rEhgy', 'siRfoz', 'sk-or-']
+
+    def test_no_hardcoded_api_keys(self):
+        for filepath in self._FILES:
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, 'r') as f:
+                content = f.read()
+            for pattern in self._PATTERNS:
+                assert pattern not in content, f"Found '{pattern}' in {filepath}"
+
+
 class TestPathTraversal:
     def test_security_py_uses_is_relative_to(self):
         with open('src/utils/security.py', 'r') as f:
