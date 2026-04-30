@@ -204,3 +204,23 @@ class TestMLXDirectSecurity:
         with open('src/core/llm/providers/mlx_direct.py', 'r') as f:
             content = f.read()
         assert '_validate_model_name' in content
+
+
+class TestNoHardcodedPaths:
+    _SCRIPTS = [
+        'merge_chapters_to_epub.py',
+        'translate_epub_by_chapter.py',
+        'translate_epub_isolated.py',
+        'translate_epub_parallel_robust.py',
+        'translate_epub_robust.py',
+        'translate_pdf_test.py',
+        'test_epub_mlx.py',
+    ]
+
+    def test_no_berton_hardcoded_paths(self):
+        for filepath in self._SCRIPTS:
+            if not os.path.exists(filepath):
+                continue
+            with open(filepath, 'r') as f:
+                content = f.read()
+            assert '/Users/berton/' not in content, f"Hardcoded path in {filepath}"
