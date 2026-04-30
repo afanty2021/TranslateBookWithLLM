@@ -175,7 +175,7 @@ window.installFFmpeg = async function() {
         if (result.success) {
             if (ttsStatusText) {
                 ttsStatusText.innerHTML = `
-                    <span style="color: #22c55e;">✅ ${result.message}</span>
+                    <span style="color: #22c55e;">✅ ${DomHelpers.escapeHtml(result.message || '')}</span>
                     <p style="margin-top: 8px; font-size: 0.8rem; color: var(--text-secondary);">
                         Please restart the application to use TTS.
                     </p>
@@ -185,7 +185,7 @@ window.installFFmpeg = async function() {
         } else {
             if (ttsStatusText) {
                 ttsStatusText.innerHTML = `
-                    <span style="color: #ef4444;">❌ Installation failed: ${result.error}</span>
+                    <span style="color: #ef4444;">❌ Installation failed: ${DomHelpers.escapeHtml(result.error || '')}</span>
                     <div style="margin-top: 10px;">
                         <a href="https://ffmpeg.org/download.html" target="_blank" class="btn btn-secondary" style="text-decoration: none;">
                             Manual Download
@@ -198,7 +198,7 @@ window.installFFmpeg = async function() {
     } catch (err) {
         if (ttsStatusText) {
             ttsStatusText.innerHTML = `
-                <span style="color: #ef4444;">❌ Installation error: ${err.message}</span>
+                <span style="color: #ef4444;">❌ Installation error: ${DomHelpers.escapeHtml(err.message || '')}</span>
                 <div style="margin-top: 10px;">
                     <a href="https://ffmpeg.org/download.html" target="_blank" class="btn btn-secondary" style="text-decoration: none;">
                         Manual Download
