@@ -19,6 +19,8 @@ class SrtAdapter(FormatAdapter):
         self.blocks: List[List[Dict]] = []
         self.translations: Dict[int, str] = {}  # global_index -> translated_text
         self.processor = None
+        self._units_cache: Optional[List[TranslationUnit]] = None
+        self._subtitle_index: Dict[int, int] = {}  # id(subtitle) -> index
 
     async def prepare_for_translation(self) -> bool:
         """Parse SRT file and group subtitles into blocks."""
@@ -36,6 +38,10 @@ class SrtAdapter(FormatAdapter):
             if not self.subtitles:
                 return False
 
+            # Build O(1) index mapping for subtitle lookup
+            self._subtitle_index = {id(s): i for i, s in enumerate(self.subtitles)}
+            self._units_cache = None
+
             # Group subtitles into blocks for translation
             lines_per_block = self.config.get('lines_per_block', 5)
             self.blocks = self.processor.group_subtitles_for_translation(
@@ -49,7 +55,10 @@ class SrtAdapter(FormatAdapter):
             return False
 
     def get_translation_units(self) -> List[TranslationUnit]:
-        """Create translation units from subtitle blocks."""
+        """Create translation units from subtitle blocks. Results are cached."""
+        if self._units_cache is not None:
+            return self._units_cache
+
         units = []
 
         for block_idx, block in enumerate(self.blocks):
@@ -58,8 +67,10 @@ class SrtAdapter(FormatAdapter):
             local_to_global = {}
 
             for local_idx, subtitle in enumerate(block):
-                # Find global index of this subtitle
-                global_idx = self.subtitles.index(subtitle)
+                # Find global index of this subtitle using O(1) lookup
+                global_idx = self._subtitle_index.get(id(subtitle))
+                if global_idx is None:
+                    global_idx = self.subtitles.index(subtitle)
                 local_to_global[local_idx] = global_idx
                 block_text_lines.append(f"[{local_idx}]{subtitle['text']}")
 
@@ -77,6 +88,14 @@ class SrtAdapter(FormatAdapter):
                 next_block = self.blocks[block_idx + 1]
                 context_after = next_block[0]['text']
 
+            # Build block_subtitles using O(1) lookup
+            block_subtitle_indices = []
+            for s in block:
+                idx = self._subtitle_index.get(id(s))
+                if idx is None:
+                    idx = self.subtitles.index(s)
+                block_subtitle_indices.append(idx)
+
             unit = TranslationUnit(
                 unit_id=f"block_{block_idx}",
                 content=block_text,
@@ -85,11 +104,12 @@ class SrtAdapter(FormatAdapter):
                 metadata={
                     'block_index': block_idx,
                     'local_to_global': local_to_global,
-                    'block_subtitles': [self.subtitles.index(s) for s in block]
+                    'block_subtitles': block_subtitle_indices
                 }
             )
             units.append(unit)
 
+        self._units_cache = units
         return units
 
     async def save_unit_translation(self, unit_id: str, translated_content: str) -> bool:
@@ -113,6 +133,8 @@ class SrtAdapter(FormatAdapter):
 
             # Store translations by global index
             self.translations.update(block_translations)
+            # Invalidate cache since state has changed
+            self._units_cache = None
 
             return True
 
