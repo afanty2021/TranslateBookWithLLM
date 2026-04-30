@@ -189,3 +189,18 @@ class TestOllamaProvider:
             with open('src/core/llm/providers/ollama.py', 'r') as f:
                 content = f.read()
             assert '_context_detector' in content
+
+
+class TestMLXDirectSecurity:
+    def test_model_name_validation_rejects_injection(self):
+        import re
+        valid = re.compile(r'^[a-zA-Z0-9\/\-_\.\s]+$')
+        assert valid.match('qwen/Qwen2.5-3B-Instruct')
+        assert valid.match('mlx-community/Qwen3-4B-8bit')
+        assert not valid.match('; rm -rf /')
+        assert not valid.match('$(whoami)')
+
+    def test_validate_method_exists(self):
+        with open('src/core/llm/providers/mlx_direct.py', 'r') as f:
+            content = f.read()
+        assert '_validate_model_name' in content

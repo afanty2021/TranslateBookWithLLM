@@ -37,6 +37,13 @@ class MLXDirectProvider(LLMProvider):
         self.log_callback = log_callback
         self._is_translategemma = "translategemma" in model.lower()
 
+    def _validate_model_name(self, model: str) -> str:
+        """校验 model 名称只包含安全字符"""
+        import re
+        if not re.match(r'^[a-zA-Z0-9\/\-_\.\s]+$', model):
+            raise ValueError(f"Invalid model name: {model}")
+        return model
+
     def _build_translategemma_prompt(self, source_lang: str, target_lang: str, text: str) -> str:
         """Build prompt for TranslateGemma model."""
         # Get ISO codes
@@ -74,6 +81,8 @@ class MLXDirectProvider(LLMProvider):
         For TranslateGemma, parses the special <<<source>>>...<<<target>>>...<<<text>>>... format
         and constructs the appropriate prompt.
         """
+        self._validate_model_name(self.model)
+
         if self._is_translategemma:
             return await self._generate_translategemma(prompt, timeout)
         else:
