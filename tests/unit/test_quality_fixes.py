@@ -137,3 +137,21 @@ class TestPathTraversal:
             content = f.read()
         assert 'is_relative_to' in content
         assert 'str(file_path_resolved).startswith' not in content
+
+
+class TestErrorHandling:
+    def test_translation_id_uses_uuid(self):
+        with open('src/api/blueprints/translation_routes.py', 'r') as f:
+            content = f.read()
+        assert 'uuid' in content
+        # 不应在翻译 ID 生成中使用 time.time()
+        id_line = [l for l in content.split('\n') if 'translation_id' in l and '=' in l and 'trans_' in l]
+        if id_line:
+            assert 'time.time()' not in id_line[0]
+
+    def test_500_no_details_without_debug(self):
+        with open('src/api/routes.py', 'r') as f:
+            content = f.read()
+        if 'errorhandler(500)' in content:
+            handler = content.split('errorhandler(500)')[1][:500]
+            assert 'DEBUG_MODE' in handler

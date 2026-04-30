@@ -3,6 +3,7 @@ Translation job management routes
 """
 import os
 import time
+import uuid
 import copy
 from flask import Blueprint, request, jsonify
 
@@ -61,7 +62,7 @@ def create_translation_blueprint(state_manager, start_translation_job):
                     return jsonify({"error": f"Missing or empty field: {field}"}), 400
 
         # Generate unique translation ID
-        translation_id = f"trans_{int(time.time() * 1000)}"
+        translation_id = f"trans_{uuid.uuid4().hex[:16]}"
 
         # Build configuration
         config = {

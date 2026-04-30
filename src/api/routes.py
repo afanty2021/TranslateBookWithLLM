@@ -70,6 +70,10 @@ def _register_error_handlers(app):
     @app.errorhandler(500)
     def internal_server_error(error):
         import traceback
+        import os
         tb_str = traceback.format_exc()
         print(f"INTERNAL SERVER ERROR: {error}\nTRACEBACK:\n{tb_str}")
-        return jsonify({"error": "Internal server error", "details": str(error)}), 500
+        response = {"error": "Internal server error"}
+        if os.getenv('DEBUG_MODE', 'false').lower() == 'true':
+            response["details"] = str(error)
+        return jsonify(response), 500
