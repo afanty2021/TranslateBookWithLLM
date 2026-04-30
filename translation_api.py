@@ -73,8 +73,9 @@ app = Flask(__name__,
             static_folder=static_folder_path,
             template_folder=template_folder_path,
             static_url_path='/static')
-CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+_allowed_origins = [f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"]
+CORS(app, origins=_allowed_origins)
+socketio = SocketIO(app, cors_allowed_origins=_allowed_origins, async_mode='threading')
 
 # Thread-safe state manager (generates unique session ID for this server instance)
 state_manager = get_state_manager()
