@@ -210,8 +210,15 @@ def create_security_blueprint(output_dir):
             existing_files = []
             missing_files = []
 
+            upload_dir_resolved = secure_file_handler.upload_dir.resolve()
             for file_path_str in file_paths:
                 file_path = Path(file_path_str)
+                try:
+                    resolved = file_path.resolve()
+                    if not resolved.is_relative_to(upload_dir_resolved):
+                        continue
+                except (ValueError, OSError):
+                    continue
                 if file_path.exists():
                     existing_files.append(file_path_str)
                 else:
@@ -244,7 +251,7 @@ def create_security_blueprint(output_dir):
             # Security: ensure file is within upload directory
             resolved = file_path.resolve()
             upload_resolved = secure_file_handler.upload_dir.resolve()
-            if not str(resolved).startswith(str(upload_resolved)):
+            if not resolved.is_relative_to(upload_resolved):
                 return jsonify({"error": "Access denied"}), 403
 
             # Read file and detect language
@@ -292,7 +299,7 @@ def create_security_blueprint(output_dir):
 
             # Security: ensure path is within thumbnails directory
             resolved = thumbnail_path.resolve()
-            if not str(resolved).startswith(str(thumbnails_dir.resolve())):
+            if not resolved.is_relative_to(thumbnails_dir.resolve()):
                 return jsonify({"error": "Access denied"}), 403
 
             if not thumbnail_path.exists():

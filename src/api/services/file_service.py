@@ -153,7 +153,7 @@ class FileService:
             upload_dir_resolved = self.uploads_dir.resolve()
 
             # Security check - ensure file is within uploads directory
-            if not str(file_path_resolved).startswith(str(upload_dir_resolved)):
+            if not file_path_resolved.is_relative_to(upload_dir_resolved):
                 return False, "Security: File not in uploads directory"
 
             # Delete the file if it exists

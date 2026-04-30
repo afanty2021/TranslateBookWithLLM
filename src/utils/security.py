@@ -246,7 +246,7 @@ class SecureFileHandler:
         resolved_path = file_path.resolve()
         upload_dir_resolved = self.upload_dir.resolve()
         
-        if not str(resolved_path).startswith(str(upload_dir_resolved)):
+        if not resolved_path.is_relative_to(upload_dir_resolved):
             raise SecurityError("Path traversal attempt detected")
         
         return resolved_path

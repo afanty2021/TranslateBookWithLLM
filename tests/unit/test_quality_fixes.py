@@ -95,3 +95,31 @@ class TestApiKeySanitization:
         assert d["source_language"] == "English"
         assert d["target_language"] == "Chinese"
         assert d["model"] == "qwen3:14b"
+
+
+class TestPathTraversal:
+    def test_security_py_uses_is_relative_to(self):
+        with open('src/utils/security.py', 'r') as f:
+            content = f.read()
+        # No startswith path validation remains (replaced by is_relative_to)
+        assert 'is_relative_to' in content
+
+    def test_verify_endpoint_restricts_to_upload_dir(self):
+        with open('src/api/blueprints/security_routes.py', 'r') as f:
+            content = f.read()
+        verify_section = content.split('def verify_uploaded_files')[1].split('\ndef ')[0]
+        assert 'upload_dir_resolved' in verify_section
+        assert 'is_relative_to' in verify_section
+
+    def test_security_routes_uses_is_relative_to(self):
+        with open('src/api/blueprints/security_routes.py', 'r') as f:
+            content = f.read()
+        assert 'is_relative_to' in content
+        # Should not have startswith path checks anymore
+        assert 'str(resolved).startswith' not in content
+
+    def test_file_service_uses_is_relative_to(self):
+        with open('src/api/services/file_service.py', 'r') as f:
+            content = f.read()
+        assert 'is_relative_to' in content
+        assert 'str(file_path_resolved).startswith' not in content
