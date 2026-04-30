@@ -236,6 +236,27 @@ class MLXProvider(LLMProvider):
         text = re.sub(r'<\|im_end\|>', '', text)
         # 清理 Qwen thinking 输出 (Thinking Process:\n...\n)
         text = re.sub(r'^Thinking Process:.*?(?=\n[^\s*]|\Z)', '', text, flags=re.DOTALL)
+        # ========== 清理思考过程标记 ==========
+        # 统一正则：匹配标记行 + 后续思考内容（直到双换行、<tag> 或文本末尾）
+        thinking_marker = (
+            r"(?:Here[''\u2019]?s a thinking process:"
+            r"|Here is a thinking process:"
+            r"|Thinking process:"
+            r"|这是一个思考过程:"
+            r"|以下是思考过程:"
+            r"|思考过程:)"
+        )
+        # 标记行 + 后续直到双换行或 <tag> 或文本末尾的所有内容
+        text = re.sub(
+            r'\n*' + thinking_marker + r'[^\n]*(?:\n(?!\n|<)[^\n]*)*',
+            '',
+            text,
+            flags=re.IGNORECASE
+        )
+        # 清理 <think ... </think 格式（Qwen 非标准闭合）
+        text = re.sub(r'<think\b[^>]*.*?</think\s*>?', '', text, flags=re.DOTALL)
+        # 清理 <thinking>...</thinking> 标签
+        text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL)
 
         return text.strip()
 
