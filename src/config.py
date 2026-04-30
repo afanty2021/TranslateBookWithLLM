@@ -537,7 +537,13 @@ class TranslationConfig:
         )
 
     def to_dict(self) -> dict:
-        """Convert to dictionary for serialization"""
+        """Convert to dictionary for serialization, masking API keys"""
+
+        def _mask_key(key: str) -> str:
+            if not key or len(key) < 8:
+                return '***' if key else ''
+            return f'***{key[-4:]}'
+
         return {
             'source_language': self.source_language,
             'target_language': self.target_language,
@@ -548,14 +554,14 @@ class TranslationConfig:
             'retry_delay': self.retry_delay,
             'context_window': self.context_window,
             'llm_provider': self.llm_provider,
-            'gemini_api_key': self.gemini_api_key,
-            'openai_api_key': self.openai_api_key,
-            'openrouter_api_key': self.openrouter_api_key,
-            'mistral_api_key': self.mistral_api_key,
-            'deepseek_api_key': self.deepseek_api_key,
-            'poe_api_key': self.poe_api_key,
-            'nim_api_key': self.nim_api_key,
-            'mlx_api_key': self.mlx_api_key,
+            'gemini_api_key': _mask_key(self.gemini_api_key),
+            'openai_api_key': _mask_key(self.openai_api_key),
+            'openrouter_api_key': _mask_key(self.openrouter_api_key),
+            'mistral_api_key': _mask_key(self.mistral_api_key),
+            'deepseek_api_key': _mask_key(self.deepseek_api_key),
+            'poe_api_key': _mask_key(self.poe_api_key),
+            'nim_api_key': _mask_key(self.nim_api_key),
+            'mlx_api_key': _mask_key(self.mlx_api_key),
             'max_tokens_per_chunk': self.max_tokens_per_chunk,
             'soft_limit_ratio': self.soft_limit_ratio
         }

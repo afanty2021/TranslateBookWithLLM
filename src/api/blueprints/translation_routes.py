@@ -101,10 +101,21 @@ def create_translation_blueprint(state_manager, start_translation_job):
         # Start translation job
         start_translation_job(translation_id, config)
 
+        # Sanitize config for response (mask API keys)
+        def _mask_key(key: str) -> str:
+            if not key or len(key) < 8:
+                return '***' if key else ''
+            return f'***{key[-4:]}'
+
+        safe_config = config.copy()
+        for k in list(safe_config.keys()):
+            if 'api_key' in k:
+                safe_config[k] = _mask_key(safe_config[k])
+
         return jsonify({
             "translation_id": translation_id,
             "message": "Translation queued.",
-            "config_received": config
+            "config_received": safe_config
         })
 
     @bp.route('/api/translation/<translation_id>', methods=['GET'])
@@ -127,6 +138,19 @@ def create_translation_blueprint(state_manager, start_translation_job):
         else:
             elapsed = stats.get('elapsed_time', time.time() - stats.get('start_time', time.time()))
 
+        # Sanitize config for response (mask API keys)
+        raw_config = job_data.get('config', {})
+        if hasattr(raw_config, 'to_dict'):
+            safe_config = raw_config.to_dict()
+        elif isinstance(raw_config, dict):
+            safe_config = raw_config.copy()
+            for k in list(safe_config.keys()):
+                if 'api_key' in k:
+                    v = safe_config[k]
+                    safe_config[k] = f'***{v[-4:]}' if v and len(v) >= 8 else '***'
+        else:
+            safe_config = {}
+
         return jsonify({
             "translation_id": translation_id,
             "status": job_data.get('status'),
@@ -141,7 +165,7 @@ def create_translation_blueprint(state_manager, start_translation_job):
             "logs": job_data.get('logs', [])[-100:],
             "result_preview": "[Preview functionality removed. Download file to view content.]" if job_data.get('status') in ['completed', 'interrupted'] else None,
             "error": job_data.get('error'),
-            "config": job_data.get('config'),
+            "config": safe_config,
             "output_filepath": job_data.get('output_filepath')
         })
 
