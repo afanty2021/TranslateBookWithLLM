@@ -224,3 +224,32 @@ class TestNoHardcodedPaths:
             with open(filepath, 'r') as f:
                 content = f.read()
             assert '/Users/berton/' not in content, f"Hardcoded path in {filepath}"
+
+
+class TestP1Fixes:
+    def test_no_duplicate_placeholder_config(self):
+        with open('src/config.py', 'r') as f:
+            content = f.read()
+        count = content.count('MAX_PLACEHOLDER_RETRIES =')
+        assert count == 1, f"Found {count} definitions of MAX_PLACEHOLDER_RETRIES"
+
+    def test_no_bare_except_in_providers(self):
+        import subprocess
+        result = subprocess.run(
+            ['grep', '-rn', 'except:', '--include=*.py',
+             'src/core/llm/providers/',
+             'translate_epub_robust.py',
+             'translate_epub_by_chapter.py',
+             'translate_epub_parallel_robust.py'],
+            capture_output=True, text=True
+        )
+        # 不应有裸 except（grep 返回非零表示没找到）
+        if result.returncode == 0:
+            lines = [l for l in result.stdout.strip().split('\n') if l and 'except Exception' not in l and 'except (' not in l]
+            assert len(lines) == 0, f"Found bare except: {lines}"
+
+    def test_security_info_no_upload_dir(self):
+        with open('src/api/blueprints/security_routes.py', 'r') as f:
+            content = f.read()
+        info_section = content.split('def ')[-1] if '/api/security/info' in content else ''
+        assert 'upload_directory' not in info_section

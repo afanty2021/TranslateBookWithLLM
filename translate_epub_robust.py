@@ -141,8 +141,9 @@ class RobustEPUBTranslator:
             try:
                 with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(f"Suppressed error: {e}")
         return {}
 
     def _is_file_translated(self, file_path: str, output_zip: zipfile.ZipFile) -> bool:

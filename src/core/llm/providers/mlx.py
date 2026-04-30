@@ -424,8 +424,9 @@ class MLXProvider(LLMProvider):
                                 error_message = error_json["error"].get("message", str(e))
                             else:
                                 error_message = str(error_json.get("error", e))
-                    except:
-                        pass
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).debug(f"Suppressed error: {e}")
 
                 # Detect context overflow
                 context_keywords = ["context_length", "maximum context", "token limit",

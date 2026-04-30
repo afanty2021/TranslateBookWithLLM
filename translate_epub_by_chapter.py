@@ -166,8 +166,9 @@ class ChapterBasedTranslator:
             try:
                 with open(self.progress_file, 'r', encoding='utf-8') as f:
                     progress_data = json.load(f)
-            except:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(f"Suppressed error: {e}")
 
         # 更新当前章节状态
         progress_data[chapter_name] = {

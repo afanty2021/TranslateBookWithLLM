@@ -192,7 +192,6 @@ def create_security_blueprint(output_dir):
                 "window_seconds": rate_limiter._window_seconds,
                 "max_requests": rate_limiter._max_requests
             },
-            "upload_directory": str(secure_file_handler.upload_dir)
         })
 
     @bp.route('/api/uploads/verify', methods=['POST'])

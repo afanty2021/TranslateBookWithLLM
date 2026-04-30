@@ -539,8 +539,9 @@ class OllamaProvider(LLMProvider):
                     try:
                         error_data = e.response.json()
                         error_message = error_data.get("error", str(e))
-                    except:
-                        pass
+                    except Exception as e:
+                        import logging
+                        logging.getLogger(__name__).debug(f"Suppressed error: {e}")
 
                 # Handle context overflow errors
                 if any(keyword in error_message.lower()

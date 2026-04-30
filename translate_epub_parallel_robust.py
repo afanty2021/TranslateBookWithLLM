@@ -133,8 +133,9 @@ class ParallelRobustEPUBTranslator:
             try:
                 with open(self.progress_file, 'r', encoding='utf-8') as f:
                     progress_data = json.load(f)
-            except:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(f"Suppressed error: {e}")
 
         # 更新当前文件状态
         progress_data[file_path] = {
@@ -157,8 +158,9 @@ class ParallelRobustEPUBTranslator:
             try:
                 with open(self.progress_file, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(f"Suppressed error: {e}")
         return {}
 
     def _is_file_translated(self, file_path: str, output_zip: zipfile.ZipFile) -> bool:
