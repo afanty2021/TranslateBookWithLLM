@@ -17,6 +17,7 @@ from ..thinking.cache import get_thinking_cache
 from ..thinking.detection import detect_repetition_loop
 from ..thinking.behavior import ThinkingBehavior, _model_matches_pattern
 from ..utils.context_detection import ContextDetector
+from ..utils.logging import LLMLogger
 
 from src.config import (
     API_ENDPOINT,
@@ -40,6 +41,8 @@ class OllamaProvider(LLMProvider):
         self.api_endpoint = api_endpoint.replace('/api/generate', '/api/chat')
         self.context_window = context_window
         self.log_callback = log_callback
+        # Override base logger with log_callback support
+        self._llm_logger = LLMLogger("Ollama", log_callback=log_callback)
         # Will be detected on first request via _detect_thinking_behavior()
         self._thinking_behavior: Optional[ThinkingBehavior] = None
         self._supports_think_param: bool = True
@@ -195,22 +198,14 @@ class OllamaProvider(LLMProvider):
 
     def _show_thinking_warning(self):
         """Display warning for uncontrollable thinking models."""
-        CYAN = '\033[96m'
-        GREEN = '\033[92m'
-        YELLOW = '\033[93m'
-        RED = '\033[91m'
-        RESET = '\033[0m'
-        BOLD = '\033[1m'
-
-        print(f"\n{RED}{'='*70}{RESET}")
-        print(f"{RED}{BOLD}[WARNING] UNCONTROLLABLE THINKING MODEL: {self.model}{RESET}")
-        print(f"{RED}{'='*70}{RESET}")
-        print(f"{YELLOW}This model produces <think> blocks that CANNOT be disabled.{RESET}")
-        print(f"{YELLOW}Consequences:{RESET}")
-        print(f"{YELLOW}  - SLOWER translations (model thinks before answering){RESET}")
-        print(f"{YELLOW}  - MORE tokens consumed (reasoning uses context window){RESET}")
-        print(f"{YELLOW}  - LESS consistent results for translation tasks{RESET}")
-        print()
+        self._llm_logger.error(f"{'='*70}")
+        self._llm_logger.error(f"[WARNING] UNCONTROLLABLE THINKING MODEL: {self.model}")
+        self._llm_logger.error(f"{'='*70}")
+        self._llm_logger.warning("This model produces <think\> blocks that CANNOT be disabled.")
+        self._llm_logger.warning("Consequences:")
+        self._llm_logger.warning("  - SLOWER translations (model thinks before answering)")
+        self._llm_logger.warning("  - MORE tokens consumed (reasoning uses context window)")
+        self._llm_logger.warning("  - LESS consistent results for translation tasks")
 
         # Suggest alternatives based on model
         model_lower = self.model.lower()
@@ -218,21 +213,21 @@ class OllamaProvider(LLMProvider):
             size_match = re.search(r':(\d+b)', model_lower)
             size = size_match.group(1) if size_match else ""
             if size:
-                print(f"{GREEN}{BOLD}RECOMMENDATION: Use 'qwen3:{size}-instruct' instead{RESET}")
-                print(f"{GREEN}  → Instruct models give direct answers without thinking{RESET}")
-                print(f"{GREEN}  → Same quality, faster speed, less token usage{RESET}")
+                self._llm_logger.info(f"RECOMMENDATION: Use 'qwen3:{size}-instruct' instead")
+                self._llm_logger.info("  → Instruct models give direct answers without thinking")
+                self._llm_logger.info("  → Same quality, faster speed, less token usage")
             else:
-                print(f"{GREEN}{BOLD}RECOMMENDATION: Use a Qwen3 instruct variant{RESET}")
-                print(f"{GREEN}  → Example: qwen3:14b-instruct, qwen3:30b-instruct{RESET}")
+                self._llm_logger.info("RECOMMENDATION: Use a Qwen3 instruct variant")
+                self._llm_logger.info("  → Example: qwen3:14b-instruct, qwen3:30b-instruct")
         elif "phi4-reasoning" in model_lower:
-            print(f"{GREEN}{BOLD}RECOMMENDATION: Use 'phi4:latest' instead{RESET}")
-            print(f"{GREEN}  → Standard Phi4 doesn't use reasoning mode{RESET}")
+            self._llm_logger.info("RECOMMENDATION: Use 'phi4:latest' instead")
+            self._llm_logger.info("  → Standard Phi4 doesn't use reasoning mode")
         elif "deepseek" in model_lower or "qwq" in model_lower:
-            print(f"{GREEN}{BOLD}RECOMMENDATION: Use a non-reasoning model{RESET}")
-            print(f"{GREEN}  → Reasoning models are for complex problems, not translation{RESET}")
+            self._llm_logger.info("RECOMMENDATION: Use a non-reasoning model")
+            self._llm_logger.info("  → Reasoning models are for complex problems, not translation")
 
-        print(f"{RED}{'='*70}{RESET}\n")
-        print(f"{CYAN}[INFO] Using think=true to cleanly separate thinking from content{RESET}\n")
+        self._llm_logger.error(f"{'='*70}")
+        self._llm_logger.info("[INFO] Using think=true to cleanly separate thinking from content")
 
     async def generate(self, prompt: str, timeout: int = REQUEST_TIMEOUT,
                       system_prompt: Optional[str] = None) -> Optional[LLMResponse]:
@@ -257,14 +252,10 @@ class OllamaProvider(LLMProvider):
             # Show warning only for uncontrollable thinking models
             if self._thinking_behavior == ThinkingBehavior.UNCONTROLLABLE and self.log_callback:
                 self._show_thinking_warning()
-            elif self._thinking_behavior == ThinkingBehavior.CONTROLLABLE and self.log_callback:
-                GREEN = '\033[92m'
-                RESET = '\033[0m'
-                print(f"\n{GREEN}[MODEL] {self.model}: Controllable thinking model - using think=false{RESET}")
-            elif self._thinking_behavior == ThinkingBehavior.STANDARD and self.log_callback:
-                GREEN = '\033[92m'
-                RESET = '\033[0m'
-                print(f"\n{GREEN}[MODEL] {self.model}: Standard model (no thinking){RESET}")
+            elif self._thinking_behavior == ThinkingBehavior.CONTROLLABLE:
+                self._llm_logger.info(f"[MODEL] {self.model}: Controllable thinking model - using think=false")
+            elif self._thinking_behavior == ThinkingBehavior.STANDARD:
+                self._llm_logger.info(f"[MODEL] {self.model}: Standard model (no thinking)")
 
         # Build messages array for chat API
         messages = []
@@ -349,11 +340,9 @@ class OllamaProvider(LLMProvider):
 
                             if estimated_tokens > max_completion_tokens:
                                 exceeded_context = True
-                                if self.log_callback:
-                                    RED = '\033[91m'
-                                    RESET = '\033[0m'
-                                    print(f"\n{RED}[STREAM ABORT] Estimated {estimated_tokens} tokens exceeds "
-                                          f"safe limit {max_completion_tokens} (context: {self.context_window}){RESET}")
+                                self._llm_logger.error(
+                                    f"[STREAM ABORT] Estimated {estimated_tokens} tokens exceeds "
+                                    f"safe limit {max_completion_tokens} (context: {self.context_window})")
                                 break
 
                             # Also check for repetition in real-time during streaming
@@ -369,10 +358,7 @@ class OllamaProvider(LLMProvider):
                                     is_thinking_content=False
                                 ):
                                     exceeded_context = True
-                                    if self.log_callback:
-                                        RED = '\033[91m'
-                                        RESET = '\033[0m'
-                                        print(f"\n{RED}[STREAM ABORT] Repetition loop detected in content{RESET}")
+                                    self._llm_logger.error("[STREAM ABORT] Repetition loop detected in content")
                                     break
 
                             # For thinking content, use more lenient detection
@@ -383,10 +369,7 @@ class OllamaProvider(LLMProvider):
                                     is_thinking_content=True
                                 ):
                                     exceeded_context = True
-                                    if self.log_callback:
-                                        RED = '\033[91m'
-                                        RESET = '\033[0m'
-                                        print(f"\n{RED}[STREAM ABORT] Repetition loop detected in thinking{RESET}")
+                                    self._llm_logger.error("[STREAM ABORT] Repetition loop detected in thinking")
                                     break
 
                             # Check if stream is done
@@ -445,24 +428,21 @@ class OllamaProvider(LLMProvider):
                         f"total={context_used}/{self.context_window} {status}")
 
                 # Log thinking content if present
-                CYAN = '\033[96m'
-                RESET = '\033[0m'
+                if thinking:
+                    self._llm_logger.info(f"{'='*80}")
+                    self._llm_logger.info(f"[THINKING FIELD] Model produced thinking ({len(thinking)} chars):")
+                    self._llm_logger.info(f"{thinking}")
+                    self._llm_logger.info(f"{'='*80}")
 
-                if thinking and self.log_callback:
-                    print(f"\n{CYAN}{'='*80}")
-                    print(f"[THINKING FIELD] Model produced thinking ({len(thinking)} chars):")
-                    print(f"{thinking}")
-                    print(f"{'='*80}{RESET}\n")
-
-                # Check for <think> blocks in content
-                if "<think>" in content.lower() and self.log_callback:
+                # Check for think blocks in content
+                if "<think>" in content.lower():
                     think_match = re.search(r'<think>(.*?)</think>', content, re.DOTALL | re.IGNORECASE)
                     if think_match:
                         think_content = think_match.group(1)
-                        print(f"\n{CYAN}{'='*80}")
-                        print(f"[THINK BLOCK IN CONTENT] Model embedded thinking ({len(think_content)} chars):")
-                        print(f"{think_content}")
-                        print(f"{'='*80}{RESET}\n")
+                        self._llm_logger.info(f"{'='*80}")
+                        self._llm_logger.info(f"[THINK BLOCK IN CONTENT] Model embedded thinking ({len(think_content)} chars):")
+                        self._llm_logger.info(f"{think_content}")
+                        self._llm_logger.info(f"{'='*80}")
 
                 # Final repetition loop check on complete response
                 # Use appropriate thresholds for thinking vs content
@@ -473,15 +453,14 @@ class OllamaProvider(LLMProvider):
                     loop_detected_in = "content"
 
                 if loop_detected_in:
-                    RED = '\033[91m'
                     error_msg = (
                         f"Repetition loop detected in {loop_detected_in}! "
                         f"This usually means the context window ({self.context_window}) is too small for thinking models. "
                         f"Try increasing OLLAMA_NUM_CTX or reducing chunk size."
                     )
-                    print(f"\n{RED}{'='*80}")
-                    print(f"[REPETITION LOOP DETECTED] {error_msg}")
-                    print(f"{'='*80}{RESET}\n")
+                    self._llm_logger.error(f"{'='*80}")
+                    self._llm_logger.error(f"[REPETITION LOOP DETECTED] {error_msg}")
+                    self._llm_logger.error(f"{'='*80}")
                     raise RepetitionLoopError(error_msg)
 
                 return LLMResponse(
@@ -494,46 +473,31 @@ class OllamaProvider(LLMProvider):
                 )
 
             except httpx.TimeoutException as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_timeout",
-                        f"{YELLOW}⚠️ LLM request timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Possible causes:{RESET}\n"
-                        f"{YELLOW}   - Model crashed or became unresponsive{RESET}\n"
-                        f"{YELLOW}   - Server overloaded or out of memory{RESET}\n"
-                        f"{YELLOW}   - Network connectivity issues{RESET}")
-                else:
-                    print(f"{YELLOW}⚠️ LLM timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}{RESET}")
+                self._llm_logger.warning(
+                    f"LLM request timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Model: {self.model}\n"
+                    f"   Possible causes:\n"
+                    f"   - Model crashed or became unresponsive\n"
+                    f"   - Server overloaded or out of memory\n"
+                    f"   - Network connectivity issues")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
                 # All retry attempts exhausted
-                if self.log_callback:
-                    self.log_callback("llm_timeout_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Translation failed - unable to reach LLM server{RESET}\n"
-                        f"{RED}   Recommendations:{RESET}\n"
-                        f"{RED}   1. Check if Ollama/llama.cpp server is running{RESET}\n"
-                        f"{RED}   2. Verify model is loaded: ollama list{RESET}\n"
-                        f"{RED}   3. Check server logs for crashes{RESET}\n"
-                        f"{RED}   4. Try reducing context size or chunk size{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.error(
+                    f"All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted\n"
+                    f"   Translation failed - unable to reach LLM server\n"
+                    f"   Recommendations:\n"
+                    f"   1. Check if Ollama/llama.cpp server is running\n"
+                    f"   2. Verify model is loaded: ollama list\n"
+                    f"   3. Check server logs for crashes\n"
+                    f"   4. Try reducing context size or chunk size")
 
                 return None
             except httpx.HTTPStatusError as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
                 error_message = str(e)
                 if e.response:
                     try:
@@ -546,106 +510,74 @@ class OllamaProvider(LLMProvider):
                 # Handle context overflow errors
                 if any(keyword in error_message.lower()
                        for keyword in ["context", "truncate", "length", "too long"]):
-                    if self.log_callback:
-                        self.log_callback("llm_context_overflow",
-                            f"{RED}❌ Context size exceeded!{RESET}\n"
-                            f"{RED}   Prompt is too large for model's context window{RESET}\n"
-                            f"{RED}   Current context window: {self.context_window} tokens{RESET}\n"
-                            f"{RED}   Error: {error_message}{RESET}\n"
-                            f"{YELLOW}   Solutions:{RESET}\n"
-                            f"{YELLOW}   1. Reduce max_tokens_per_chunk (current chunk may be too large){RESET}\n"
-                            f"{YELLOW}   2. Increase OLLAMA_NUM_CTX in .env file{RESET}\n"
-                            f"{YELLOW}   3. Use a model with larger context window{RESET}")
-                    else:
-                        print(f"{RED}Context size exceeded: {error_message}{RESET}")
+                    self._llm_logger.error(
+                        f"Context size exceeded!\n"
+                        f"   Prompt is too large for model's context window\n"
+                        f"   Current context window: {self.context_window} tokens\n"
+                        f"   Error: {error_message}\n"
+                        f"   Solutions:\n"
+                        f"   1. Reduce max_tokens_per_chunk (current chunk may be too large)\n"
+                        f"   2. Increase OLLAMA_NUM_CTX in .env file\n"
+                        f"   3. Use a model with larger context window")
                     raise ContextOverflowError(error_message)
 
                 # Handle other HTTP errors
-                if self.log_callback:
-                    self.log_callback("llm_http_error",
-                        f"{YELLOW}⚠️ HTTP error from LLM server (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Status: {e.response.status_code if e.response else 'unknown'}{RESET}\n"
-                        f"{YELLOW}   Error: {error_message}{RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}")
-                else:
-                    print(f"{YELLOW}HTTP error (attempt {attempt + 1}): {error_message}{RESET}")
+                self._llm_logger.warning(
+                    f"HTTP error from LLM server (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Status: {e.response.status_code if e.response else 'unknown'}\n"
+                    f"   Error: {error_message}\n"
+                    f"   Model: {self.model}")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
                 # All retries exhausted
-                if self.log_callback:
-                    self.log_callback("llm_http_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   HTTP error persists - translation failed{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.error(
+                    f"All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted\n"
+                    f"   HTTP error persists - translation failed")
 
                 return None
             except (RepetitionLoopError, ContextOverflowError):
                 # These errors should propagate up for handling by translator
                 raise
             except json.JSONDecodeError as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_json_error",
-                        f"{YELLOW}⚠️ Invalid JSON response from LLM (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Error: {str(e)}{RESET}\n"
-                        f"{YELLOW}   This may indicate:{RESET}\n"
-                        f"{YELLOW}   - Server returned malformed response{RESET}\n"
-                        f"{YELLOW}   - Model output corrupted{RESET}\n"
-                        f"{YELLOW}   - API endpoint incompatibility{RESET}")
-                else:
-                    print(f"{YELLOW}JSON decode error (attempt {attempt + 1}): {e}{RESET}")
+                self._llm_logger.warning(
+                    f"Invalid JSON response from LLM (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Model: {self.model}\n"
+                    f"   Error: {str(e)}\n"
+                    f"   This may indicate:\n"
+                    f"   - Server returned malformed response\n"
+                    f"   - Model output corrupted\n"
+                    f"   - API endpoint incompatibility")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
-                if self.log_callback:
-                    self.log_callback("llm_json_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Unable to parse LLM response - translation failed{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.error(
+                    f"All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted\n"
+                    f"   Unable to parse LLM response - translation failed")
 
                 return None
             except Exception as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_unexpected_error",
-                        f"{YELLOW}⚠️ Unexpected error during LLM request (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Error type: {type(e).__name__}{RESET}\n"
-                        f"{YELLOW}   Error: {str(e)}{RESET}")
-                else:
-                    print(f"{YELLOW}Unexpected error (attempt {attempt + 1}): {type(e).__name__}: {e}{RESET}")
+                self._llm_logger.warning(
+                    f"Unexpected error during LLM request (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Model: {self.model}\n"
+                    f"   Error type: {type(e).__name__}\n"
+                    f"   Error: {str(e)}")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
-                if self.log_callback:
-                    self.log_callback("llm_unexpected_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Unexpected error persists - translation failed{RESET}\n"
-                        f"{RED}   Please report this issue with the error details above{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.error(
+                    f"All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted\n"
+                    f"   Unexpected error persists - translation failed\n"
+                    f"   Please report this issue with the error details above")
 
                 return None
 
