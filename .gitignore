@@ -8,7 +8,6 @@ __pycache__/
 CLAUDE.md
 .env
 .spec-workflow/
-/docs
 /venv
 build_installer.bat
 build/dist/
