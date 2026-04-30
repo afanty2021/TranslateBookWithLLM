@@ -109,8 +109,11 @@ def create_config_blueprint(server_session_id=None):
             api_key = data.get('api_key')
         else:
             # GET method - for Ollama or legacy compatibility
+            # Security: do NOT read api_key from query parameters
+            # (would be exposed in browser history and server logs).
+            # Instead, rely on server-side configured keys via _resolve_api_key.
             provider = request.args.get('provider', 'ollama')
-            api_key = request.args.get('api_key')
+            api_key = None
 
         if provider == 'gemini':
             return _get_gemini_models(api_key)
