@@ -63,17 +63,10 @@ if not _env_exists:
         print(f"   • Port: 5000")
         print(f"\n💡 TIP: If using a remote server or different provider, you MUST")
         print(f"   create a .env file with the correct settings.\n")
-        print("="*70)
-        print("Press Ctrl+C to stop and configure, or wait 5 seconds to continue...")
         print("="*70 + "\n")
 
-        # Give user time to read and react
-        import time
-        try:
-            time.sleep(5)
-        except KeyboardInterrupt:
-            print("\n\n⏹️  Startup cancelled by user. Please configure .env and try again.\n")
-            sys.exit(0)
+        # Non-blocking warning log (replaces previous blocking call)
+        _config_logger.warning("No .env file found. Using default configuration.")
     else:
         # Running as executable - silently use defaults
         if _debug_mode:

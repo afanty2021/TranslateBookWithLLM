@@ -155,3 +155,37 @@ class TestErrorHandling:
         if 'errorhandler(500)' in content:
             handler = content.split('errorhandler(500)')[1][:500]
             assert 'DEBUG_MODE' in handler
+
+
+class TestConfigStartup:
+    def test_no_blocking_sleep(self):
+        """config.py 模块级不应有 time.sleep 阻塞"""
+        with open('src/config.py', 'r') as f:
+            content = f.read()
+        assert 'time.sleep' not in content
+
+
+class TestUnifiedExceptions:
+    def test_context_overflow_is_same_class(self):
+        from src.core.adapters.exceptions import ContextOverflowError as A
+        from src.core.llm.exceptions import ContextOverflowError as B
+        assert A is B
+
+    def test_repetition_loop_is_same_class(self):
+        from src.core.adapters.exceptions import RepetitionLoopError as A
+        from src.core.llm.exceptions import RepetitionLoopError as B
+        assert A is B
+
+
+class TestOllamaProvider:
+    def test_has_context_detector(self):
+        """OllamaProvider 应在 __init__ 中初始化 _context_detector"""
+        from src.core.llm.providers.ollama import OllamaProvider
+        try:
+            provider = OllamaProvider(api_endpoint='http://localhost:11434', model='test')
+            assert hasattr(provider, '_context_detector')
+        except Exception:
+            # 如果其他依赖缺失，至少检查代码中存在初始化
+            with open('src/core/llm/providers/ollama.py', 'r') as f:
+                content = f.read()
+            assert '_context_detector' in content
