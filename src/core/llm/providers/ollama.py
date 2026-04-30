@@ -43,6 +43,8 @@ class OllamaProvider(LLMProvider):
         # Will be detected on first request via _detect_thinking_behavior()
         self._thinking_behavior: Optional[ThinkingBehavior] = None
         self._supports_think_param: bool = True
+        # Context size detection
+        self._context_detector = ContextDetector()
         # Quick check against known model lists (fallback if detection fails)
         self._known_uncontrollable = any(_model_matches_pattern(model, tm) for tm in UNCONTROLLABLE_THINKING_MODELS)
         self._known_controllable = any(_model_matches_pattern(model, tm) for tm in CONTROLLABLE_THINKING_MODELS)
