@@ -11,14 +11,14 @@ from pathlib import Path
 from typing import Optional
 
 # 添加项目根目录到路径
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 
 from src.core.llm.providers.mlx import MLXProvider
 from src.config import OLLAMA_NUM_CTX
 from dotenv import load_dotenv
 
-# 加载环境变量
-load_dotenv()
+# 加载环境变量（从项目根目录）
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env'))
 
 
 class EPUBRangeTranslator:
