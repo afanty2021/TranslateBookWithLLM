@@ -19,6 +19,7 @@ import json
 from src.config import REQUEST_TIMEOUT, MAX_TRANSLATION_ATTEMPTS
 from ..base import LLMProvider, LLMResponse
 from ..exceptions import ContextOverflowError, RateLimitError
+from ..utils.logging import LLMLogger
 
 
 class OpenRouterProvider(LLMProvider):
@@ -90,6 +91,7 @@ class OpenRouterProvider(LLMProvider):
         """
         super().__init__(model)
         self.api_key = api_key
+        self._llm_logger = LLMLogger("OpenRouter")
 
     @classmethod
     def get_session_cost(cls) -> tuple:
@@ -201,7 +203,7 @@ class OpenRouterProvider(LLMProvider):
             return filtered_models
 
         except Exception as e:
-            print(f"⚠️ Failed to fetch OpenRouter models: {e}")
+            self._llm_logger.warning(f"Failed to fetch OpenRouter models: {e}")
             return self._get_fallback_models()
 
     def _get_fallback_models(self) -> list:
@@ -262,7 +264,7 @@ class OpenRouterProvider(LLMProvider):
                 result = response.json()
 
                 if "choices" not in result or len(result["choices"]) == 0:
-                    print(f"⚠️ OpenRouter: Unexpected response format: {result}")
+                    self._llm_logger.warning(f"Unexpected response format: {result}")
                     return None
 
                 response_text = result["choices"][0].get("message", {}).get("content", "")
@@ -285,8 +287,10 @@ class OpenRouterProvider(LLMProvider):
                 OpenRouterProvider._session_tokens["completion"] += completion_tokens
 
                 # Log cost info
-                print(f"💰 OpenRouter: {prompt_tokens}+{completion_tokens} tokens | "
-                      f"Cost: ${cost:.6f} (session: ${OpenRouterProvider._session_cost:.4f})")
+                self._llm_logger.info(
+                    f"OpenRouter: {prompt_tokens}+{completion_tokens} tokens | "
+                    f"Cost: ${cost:.6f} (session: ${OpenRouterProvider._session_cost:.4f})"
+                )
 
                 # Call cost callback if set
                 if OpenRouterProvider._cost_callback:
@@ -300,7 +304,7 @@ class OpenRouterProvider(LLMProvider):
                             "total_completion_tokens": OpenRouterProvider._session_tokens["completion"],
                         })
                     except Exception as cb_err:
-                        print(f"⚠️ Cost callback error: {cb_err}")
+                        self._llm_logger.warning(f"Cost callback error: {cb_err}")
 
                 return LLMResponse(
                     content=response_text,
@@ -312,7 +316,7 @@ class OpenRouterProvider(LLMProvider):
                 )
 
             except httpx.TimeoutException as e:
-                print(f"OpenRouter API Timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
+                self._llm_logger.timeout(attempt, MAX_TRANSLATION_ATTEMPTS)
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                     await asyncio.sleep(2)
                     continue
@@ -325,10 +329,9 @@ class OpenRouterProvider(LLMProvider):
                     error_message = f"{e} - {error_body}"
 
                 # Handle rate limiting (429)
-                if e.response.status_code == 429:
-                    retry_after_header = e.response.headers.get("Retry-After")
-                    wait_time = int(retry_after_header) if retry_after_header else min(2 ** (attempt + 2), 60)
-                    print(f"⚠️ OpenRouter rate limited (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), waiting {wait_time}s...")
+                if self._is_rate_limited(e.response.status_code):
+                    wait_time = self._get_retry_wait(attempt, dict(e.response.headers))
+                    self._llm_logger.rate_limit(attempt, MAX_TRANSLATION_ATTEMPTS, wait_time)
                     if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                         await asyncio.sleep(wait_time)
                         continue
@@ -352,10 +355,7 @@ class OpenRouterProvider(LLMProvider):
                     print(f"Response details: Status {e.response.status_code}, Body: {error_body}...")
 
                 # Detect context overflow errors
-                context_overflow_keywords = ["context_length", "maximum context", "token limit",
-                                              "too many tokens", "reduce the length", "max_tokens",
-                                              "context window", "exceeds"]
-                if any(keyword in error_message.lower() for keyword in context_overflow_keywords):
+                if self._is_context_overflow(error_message):
                     raise ContextOverflowError(f"OpenRouter context overflow: {error_message}")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:

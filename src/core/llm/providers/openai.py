@@ -13,6 +13,7 @@ import httpx
 from ..base import LLMProvider, LLMResponse
 from ..exceptions import ContextOverflowError, RateLimitError
 from ..utils.context_detection import ContextDetector
+from ..utils.logging import LLMLogger
 
 from src.config import (
     REQUEST_TIMEOUT,
@@ -31,6 +32,7 @@ class OpenAICompatibleProvider(LLMProvider):
         self.api_key = api_key
         self.context_window = context_window
         self.log_callback = log_callback
+        self._llm_logger = LLMLogger("OpenAI-compatible", log_callback=log_callback)
         self._detected_context_size: Optional[int] = None
         self._context_detector = ContextDetector()
 
@@ -140,49 +142,18 @@ class OpenAICompatibleProvider(LLMProvider):
                 )
 
             except httpx.TimeoutException as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_timeout",
-                        f"{YELLOW}⚠️ LLM request timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Endpoint: {self.api_endpoint}{RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Possible causes:{RESET}\n"
-                        f"{YELLOW}   - llama.cpp/LM Studio server crashed or became unresponsive{RESET}\n"
-                        f"{YELLOW}   - Server overloaded or out of memory{RESET}\n"
-                        f"{YELLOW}   - Network connectivity issues{RESET}\n"
-                        f"{YELLOW}   - Model too large for available VRAM{RESET}")
-                else:
-                    print(f"{YELLOW}⚠️ OpenAI-compatible API Timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}{RESET}")
+                self._llm_logger.timeout(attempt, MAX_TRANSLATION_ATTEMPTS, self.api_endpoint)
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
                 # All retry attempts exhausted
-                if self.log_callback:
-                    self.log_callback("llm_timeout_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Translation failed - unable to reach LLM server{RESET}\n"
-                        f"{RED}   Recommendations:{RESET}\n"
-                        f"{RED}   1. Check if llama.cpp/LM Studio server is running{RESET}\n"
-                        f"{RED}   2. Verify server is accessible at: {self.api_endpoint}{RESET}\n"
-                        f"{RED}   3. Check server console/logs for crashes or OOM errors{RESET}\n"
-                        f"{RED}   4. Try reducing context size or chunk size{RESET}\n"
-                        f"{RED}   5. Ensure model fits in available VRAM/RAM{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.all_retries_exhausted()
 
                 return None
             except httpx.HTTPStatusError as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
                 error_message = str(e)
                 error_body = ""
                 if hasattr(e, 'response') and hasattr(e.response, 'text'):
@@ -201,14 +172,9 @@ class OpenAICompatibleProvider(LLMProvider):
                         error_message = f"{e} - {error_body}"
 
                 # Handle rate limiting (429)
-                if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
-                    retry_after_header = e.response.headers.get("Retry-After")
-                    wait_time = int(retry_after_header) if retry_after_header else min(2 ** (attempt + 2), 60)
-                    if self.log_callback:
-                        self.log_callback("llm_rate_limit",
-                            f"{YELLOW}⚠️ Rate limited (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), waiting {wait_time}s...{RESET}")
-                    else:
-                        print(f"⚠️ Rate limited (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), waiting {wait_time}s...")
+                if self._is_rate_limited(e.response.status_code):
+                    wait_time = self._get_retry_wait(attempt, dict(e.response.headers))
+                    self._llm_logger.rate_limit(attempt, MAX_TRANSLATION_ATTEMPTS, wait_time)
                     if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                         await asyncio.sleep(wait_time)
                         continue
@@ -219,128 +185,71 @@ class OpenAICompatibleProvider(LLMProvider):
                     )
 
                 # Detect context overflow errors
-                context_overflow_keywords = ["context_length", "maximum context", "token limit",
-                                              "too many tokens", "reduce the length", "max_tokens",
-                                              "context", "truncate", "length", "too long"]
-                if any(keyword in error_message.lower() for keyword in context_overflow_keywords):
-                    RED = '\033[91m'
-                    YELLOW = '\033[93m'
-                    RESET = '\033[0m'
-
-                    if self.log_callback:
-                        self.log_callback("llm_context_overflow",
-                            f"{RED}❌ Context size exceeded!{RESET}\n"
-                            f"{RED}   Prompt is too large for model's context window{RESET}\n"
-                            f"{RED}   Current context window: {self.context_window} tokens{RESET}\n"
-                            f"{RED}   Error: {error_message}{RESET}\n"
-                            f"{YELLOW}   Solutions:{RESET}\n"
-                            f"{YELLOW}   1. Reduce max_tokens_per_chunk (current chunk may be too large){RESET}\n"
-                            f"{YELLOW}   2. Increase context size in server configuration{RESET}\n"
-                            f"{YELLOW}   3. Use a model with larger context window{RESET}\n"
-                            f"{YELLOW}   4. For llama.cpp: increase -c/--ctx-size parameter{RESET}")
-                    else:
-                        print(f"{RED}Context size exceeded: {error_message}{RESET}")
+                if self._is_context_overflow(error_message):
+                    self._llm_logger.error(
+                        f"Context size exceeded!\n"
+                        f"   Prompt is too large for model's context window\n"
+                        f"   Current context window: {self.context_window} tokens\n"
+                        f"   Error: {error_message}\n"
+                        f"   Solutions:\n"
+                        f"   1. Reduce max_tokens_per_chunk (current chunk may be too large)\n"
+                        f"   2. Increase context size in server configuration\n"
+                        f"   3. Use a model with larger context window\n"
+                        f"   4. For llama.cpp: increase -c/--ctx-size parameter"
+                    )
                     raise ContextOverflowError(error_message)
 
                 # Handle other HTTP errors with detailed information
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    status_code = e.response.status_code if e.response else 'unknown'
-                    self.log_callback("llm_http_error",
-                        f"{YELLOW}⚠️ HTTP error from LLM server (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Endpoint: {self.api_endpoint}{RESET}\n"
-                        f"{YELLOW}   Status: {e.response.status_code if e.response else 'unknown'}{RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Error: {error_message}{RESET}")
-                    if error_body:
-                        self.log_callback("llm_http_error_detail", f"{YELLOW}   Response: {error_body[:200]}...{RESET}")
-                else:
-                    print(f"{YELLOW}⚠️ OpenAI-compatible API HTTP Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}{RESET}")
-                    if error_body:
-                        print(f"{YELLOW}   Response: {error_body[:200]}...{RESET}")
+                status_code = e.response.status_code if e.response else 'unknown'
+                self._llm_logger.http_error(attempt, MAX_TRANSLATION_ATTEMPTS, status_code, error_message, self.api_endpoint)
+                if error_body:
+                    self._llm_logger.warning(f"   Response: {error_body[:200]}...")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
                 # All retries exhausted
-                if self.log_callback:
-                    self.log_callback("llm_http_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   HTTP error persists - translation failed{RESET}\n"
-                        f"{RED}   Status: {e.response.status_code if e.response else 'unknown'}{RESET}\n"
-                        f"{RED}   Check server logs for more details{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.all_retries_exhausted()
 
                 return None
             except json.JSONDecodeError as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_json_error",
-                        f"{YELLOW}⚠️ Invalid JSON response from LLM (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Endpoint: {self.api_endpoint}{RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Error: {str(e)}{RESET}\n"
-                        f"{YELLOW}   This may indicate:{RESET}\n"
-                        f"{YELLOW}   - Server returned malformed response{RESET}\n"
-                        f"{YELLOW}   - llama.cpp server crashed mid-response{RESET}\n"
-                        f"{YELLOW}   - API endpoint incompatibility{RESET}\n"
-                        f"{YELLOW}   - Server configuration issues{RESET}")
-                else:
-                    print(f"{YELLOW}⚠️ OpenAI-compatible API JSON Decode Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}{RESET}")
+                self._llm_logger.warning(
+                    f"Invalid JSON response from LLM (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Endpoint: {self.api_endpoint}\n"
+                    f"   Model: {self.model}\n"
+                    f"   Error: {str(e)}\n"
+                    f"   This may indicate:\n"
+                    f"   - Server returned malformed response\n"
+                    f"   - llama.cpp server crashed mid-response\n"
+                    f"   - API endpoint incompatibility\n"
+                    f"   - Server configuration issues"
+                )
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
-                if self.log_callback:
-                    self.log_callback("llm_json_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Unable to parse LLM response - translation failed{RESET}\n"
-                        f"{RED}   Verify server is running and endpoint is correct{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.all_retries_exhausted()
 
                 return None
             except Exception as e:
-                RED = '\033[91m'
-                YELLOW = '\033[93m'
-                RESET = '\033[0m'
-
-                if self.log_callback:
-                    self.log_callback("llm_unexpected_error",
-                        f"{YELLOW}⚠️ Unexpected error during LLM request (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}){RESET}\n"
-                        f"{YELLOW}   Endpoint: {self.api_endpoint}{RESET}\n"
-                        f"{YELLOW}   Model: {self.model}{RESET}\n"
-                        f"{YELLOW}   Error type: {type(e).__name__}{RESET}\n"
-                        f"{YELLOW}   Error: {str(e)}{RESET}")
-                else:
-                    print(f"{YELLOW}⚠️ OpenAI-compatible API Unknown Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {type(e).__name__}: {e}{RESET}")
+                self._llm_logger.warning(
+                    f"Unexpected error during LLM request (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS})\n"
+                    f"   Endpoint: {self.api_endpoint}\n"
+                    f"   Model: {self.model}\n"
+                    f"   Error type: {type(e).__name__}\n"
+                    f"   Error: {str(e)}"
+                )
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
-                    if self.log_callback:
-                        self.log_callback("llm_retry", f"   Retrying in 2 seconds...")
+                    self._llm_logger.retry_hint()
                     await asyncio.sleep(2)
                     continue
 
-                if self.log_callback:
-                    self.log_callback("llm_unexpected_error_fatal",
-                        f"{RED}❌ All {MAX_TRANSLATION_ATTEMPTS} retry attempts exhausted{RESET}\n"
-                        f"{RED}   Unexpected error persists - translation failed{RESET}\n"
-                        f"{RED}   Please report this issue with the error details above{RESET}")
-                else:
-                    print(f"{RED}❌ All retry attempts exhausted. Translation failed.{RESET}")
+                self._llm_logger.all_retries_exhausted()
 
                 return None
 

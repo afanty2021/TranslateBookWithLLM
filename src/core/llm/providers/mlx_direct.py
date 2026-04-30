@@ -13,6 +13,7 @@ import httpx
 
 from ..base import LLMProvider, LLMResponse
 from ..exceptions import ContextOverflowError, RateLimitError
+from ..utils.language import language_to_code
 
 from src.config import (
     REQUEST_TIMEOUT,
@@ -47,31 +48,12 @@ class MLXDirectProvider(LLMProvider):
     def _build_translategemma_prompt(self, source_lang: str, target_lang: str, text: str) -> str:
         """Build prompt for TranslateGemma model."""
         # Get ISO codes
-        source_code = self._language_to_code(source_lang)
-        target_code = self._language_to_code(target_lang)
+        source_code = language_to_code(source_lang)
+        target_code = language_to_code(target_lang)
 
         # TranslateGemma chat template format
         # We need to manually construct the prompt since we're calling mlx-lm directly
         return f"<start_of_turn>user\nYou are a professional {source_lang} ({source_code}) to {target_lang} ({target_code}) translator. Your goal is to accurately convey the meaning and nuances of the original {source_lang} text while adhering to {target_lang} grammar, vocabulary, and cultural sensitivities.\n\nProduce only the {target_lang} translation, without any additional explanations or commentary. Please translate the following {source_lang} text into {target_lang}:\n\n\n{text}<end_of_turn>\n<start_of_turn>model\n"
-
-    def _language_to_code(self, lang: str) -> str:
-        """Convert language name to ISO code."""
-        lang_map = {
-            "english": "en",
-            "chinese": "zh",
-            "french": "fr",
-            "german": "de",
-            "spanish": "es",
-            "japanese": "ja",
-            "korean": "ko",
-            "russian": "ru",
-            "italian": "it",
-            "portuguese": "pt",
-            "arabic": "ar",
-            "hindi": "hi",
-        }
-        lang_lower = lang.lower()
-        return lang_map.get(lang_lower, lang_lower)
 
     async def generate(self, prompt: str, timeout: int = REQUEST_TIMEOUT,
                       system_prompt: Optional[str] = None) -> Optional[LLMResponse]:

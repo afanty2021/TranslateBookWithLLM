@@ -19,6 +19,7 @@ import json
 from src.config import REQUEST_TIMEOUT, MAX_TRANSLATION_ATTEMPTS
 from ..base import LLMProvider, LLMResponse
 from ..exceptions import ContextOverflowError, RateLimitError
+from ..utils.logging import LLMLogger
 
 
 class MistralProvider(LLMProvider):
@@ -88,6 +89,7 @@ class MistralProvider(LLMProvider):
         super().__init__(model)
         self.api_key = api_key
         self.api_endpoint = api_endpoint or self.API_URL
+        self._llm_logger = LLMLogger("Mistral")
 
     def _get_context_limit(self) -> int:
         """
@@ -159,7 +161,7 @@ class MistralProvider(LLMProvider):
             return filtered_models
 
         except Exception as e:
-            print(f"⚠️ Failed to fetch Mistral models: {e}")
+            self._llm_logger.warning(f"Failed to fetch Mistral models: {e}")
             return self._get_fallback_models()
 
     def _get_fallback_models(self) -> list:
@@ -234,10 +236,9 @@ class MistralProvider(LLMProvider):
                 if response.status_code == 401:
                     raise ValueError("Invalid Mistral API key")
 
-                if response.status_code == 429:
-                    retry_after_header = response.headers.get("Retry-After")
-                    wait_time = int(retry_after_header) if retry_after_header else min(2 ** (attempt + 2), 60)
-                    print(f"⚠️ Mistral rate limited (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), waiting {wait_time}s...")
+                if self._is_rate_limited(response.status_code):
+                    wait_time = self._get_retry_wait(attempt, dict(response.headers))
+                    self._llm_logger.rate_limit(attempt, MAX_TRANSLATION_ATTEMPTS, wait_time)
                     if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                         await asyncio.sleep(wait_time)
                         continue
@@ -251,7 +252,7 @@ class MistralProvider(LLMProvider):
                 result = response.json()
 
                 if "choices" not in result or len(result["choices"]) == 0:
-                    print(f"⚠️ Mistral: Unexpected response format: {result}")
+                    self._llm_logger.warning(f"Unexpected response format: {result}")
                     return None
 
                 response_text = result["choices"][0].get("message", {}).get("content", "")
@@ -261,7 +262,7 @@ class MistralProvider(LLMProvider):
                 prompt_tokens = usage.get("prompt_tokens", 0)
                 completion_tokens = usage.get("completion_tokens", 0)
 
-                print(f"💬 Mistral: {prompt_tokens}+{completion_tokens} tokens")
+                self._llm_logger.info(f"Mistral: {prompt_tokens}+{completion_tokens} tokens")
 
                 return LLMResponse(
                     content=response_text,
@@ -273,7 +274,7 @@ class MistralProvider(LLMProvider):
                 )
 
             except httpx.TimeoutException as e:
-                print(f"Mistral API Timeout (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
+                self._llm_logger.timeout(attempt, MAX_TRANSLATION_ATTEMPTS)
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                     await asyncio.sleep(2)
                     continue
@@ -288,23 +289,18 @@ class MistralProvider(LLMProvider):
 
                 # Handle specific error codes
                 if e.response.status_code == 404:
-                    print(f"❌ Mistral: Model '{self.model}' not found!")
-                    print(f"   Check available models at https://docs.mistral.ai/")
+                    self._llm_logger.error(f"Model '{self.model}' not found!")
+                    self._llm_logger.warning("   Check available models at https://docs.mistral.ai/")
                 elif e.response.status_code == 401:
-                    print(f"❌ Mistral: Invalid API key!")
+                    self._llm_logger.error("Invalid API key!")
                 elif e.response.status_code == 402:
-                    print(f"❌ Mistral: Insufficient credits!")
+                    self._llm_logger.error("Insufficient credits!")
                 else:
-                    print(f"Mistral API HTTP Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
-                    print(f"Response details: Status {e.response.status_code}, Body: {error_body}...")
+                    self._llm_logger.http_error(attempt, MAX_TRANSLATION_ATTEMPTS, e.response.status_code, str(e))
+                    self._llm_logger.warning(f"   Response details: Status {e.response.status_code}, Body: {error_body}...")
 
                 # Detect context overflow errors
-                context_overflow_keywords = [
-                    "context_length", "maximum context", "token limit",
-                    "too many tokens", "reduce the length", "max_tokens",
-                    "context window", "exceeds"
-                ]
-                if any(keyword in error_message.lower() for keyword in context_overflow_keywords):
+                if self._is_context_overflow(error_message):
                     raise ContextOverflowError(f"Mistral context overflow: {error_message}")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
@@ -313,14 +309,14 @@ class MistralProvider(LLMProvider):
                 return None
 
             except json.JSONDecodeError as e:
-                print(f"Mistral API JSON Decode Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
+                self._llm_logger.warning(f"JSON decode error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                     await asyncio.sleep(2)
                     continue
                 return None
 
             except Exception as e:
-                print(f"Mistral API Unknown Error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
+                self._llm_logger.warning(f"Unknown error (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}): {e}")
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                     await asyncio.sleep(2)
                     continue

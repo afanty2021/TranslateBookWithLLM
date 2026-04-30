@@ -13,6 +13,7 @@ import httpx
 from src.config import TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT, REQUEST_TIMEOUT
 from src.utils.telemetry import get_telemetry_headers
 from src.core.llm.utils.extraction import TranslationExtractor
+from src.core.llm.utils.logging import LLMLogger
 
 
 @dataclass
@@ -38,6 +39,7 @@ class LLMProvider(ABC):
         """
         self.model = model
         self._extractor = TranslationExtractor(TRANSLATE_TAG_IN, TRANSLATE_TAG_OUT)
+        self._llm_logger = LLMLogger(model)
         self._client = None
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -92,6 +94,43 @@ class LLMProvider(ABC):
             Extracted translation text, or None if extraction fails
         """
         return self._extractor.extract(response)
+
+    # ------------------------------------------------------------------
+    # Reusable error handling helpers
+    # ------------------------------------------------------------------
+
+    def _is_context_overflow(self, error_message: str) -> bool:
+        """Check whether *error_message* indicates a context overflow.
+
+        Uses the shared ``CONTEXT_OVERFLOW_KEYWORDS`` list from
+        :pymod:`src.core.llm.constants`.  Matching is case-insensitive.
+        """
+        from .constants import CONTEXT_OVERFLOW_KEYWORDS
+        msg_lower = error_message.lower()
+        return any(kw in msg_lower for kw in CONTEXT_OVERFLOW_KEYWORDS)
+
+    def _is_rate_limited(self, status_code: int) -> bool:
+        """Return ``True`` when *status_code* is an HTTP 429."""
+        return status_code == 429
+
+    def _get_retry_wait(self, attempt: int, response_headers: dict = None) -> int:
+        """Return the number of seconds to wait before retrying.
+
+        If *response_headers* contains a ``Retry-After`` header its integer
+        value is used directly.  Otherwise the exponential back-off provided by
+        :func:`src.core.llm.constants.default_retry_wait` is used.
+        """
+        from .constants import default_retry_wait
+        if response_headers:
+            retry_after = response_headers.get("Retry-After")
+            if retry_after:
+                try:
+                    return int(retry_after)
+                except (ValueError, TypeError):
+                    pass
+        return default_retry_wait(attempt)
+
+    # ------------------------------------------------------------------
 
     async def translate_text(self, prompt: str) -> Optional[str]:
         """Complete translation workflow: request + extraction"""

@@ -372,9 +372,8 @@ class PoeProvider(LLMProvider):
                     print(f"   Check your subscription at: https://poe.com/subscribe")
                     return None
 
-                if response.status_code == 429:
-                    retry_after_header = response.headers.get("Retry-After")
-                    wait_time = int(retry_after_header) if retry_after_header else min(2 ** (attempt + 2), 60)
+                if self._is_rate_limited(response.status_code):
+                    wait_time = self._get_retry_wait(attempt, dict(response.headers))
                     print(f"⚠️ Poe rate limited (attempt {attempt + 1}/{MAX_TRANSLATION_ATTEMPTS}), waiting {wait_time}s...")
                     if attempt < MAX_TRANSLATION_ATTEMPTS - 1:
                         await asyncio.sleep(wait_time)
@@ -449,12 +448,7 @@ class PoeProvider(LLMProvider):
                     print(f"Response details: Status {e.response.status_code}, Body: {error_body}...")
 
                 # Detect context overflow errors
-                context_overflow_keywords = [
-                    "context_length", "maximum context", "token limit",
-                    "too many tokens", "reduce the length", "max_tokens",
-                    "context window", "exceeds"
-                ]
-                if any(keyword in error_message.lower() for keyword in context_overflow_keywords):
+                if self._is_context_overflow(error_message):
                     raise ContextOverflowError(f"Poe context overflow: {error_message}")
 
                 if attempt < MAX_TRANSLATION_ATTEMPTS - 1:

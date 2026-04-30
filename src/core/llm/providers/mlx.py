@@ -12,6 +12,7 @@ import httpx
 
 from ..base import LLMProvider, LLMResponse
 from ..exceptions import ContextOverflowError, RateLimitError
+from ..utils.language import language_to_code
 
 from src.config import (
     REQUEST_TIMEOUT,
@@ -98,8 +99,8 @@ class MLXProvider(LLMProvider):
                         text = part.split(">>>", 1)[1].strip()
 
                 # Convert language names to ISO codes if needed
-                source_code = self._language_to_code(source_lang)
-                target_code = self._language_to_code(target_lang)
+                source_code = language_to_code(source_lang)
+                target_code = language_to_code(target_lang)
 
                 # Debug output
                 if self.log_callback:
@@ -164,8 +165,8 @@ class MLXProvider(LLMProvider):
                             self.log_callback("mlx_debug", f"Extracted from <SOURCE_TEXT>: source={source_lang}, target={target_lang}, text_length={len(text_to_translate)}")
 
                 # Convert language names to ISO codes
-                source_code = self._language_to_code(source_lang)
-                target_code = self._language_to_code(target_lang)
+                source_code = language_to_code(source_lang)
+                target_code = language_to_code(target_lang)
 
                 return [
                     {
@@ -187,25 +188,6 @@ class MLXProvider(LLMProvider):
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
             return messages
-
-    def _language_to_code(self, lang: str) -> str:
-        """Convert language name to ISO code."""
-        lang_map = {
-            "english": "en",
-            "chinese": "zh",
-            "french": "fr",
-            "german": "de",
-            "spanish": "es",
-            "japanese": "ja",
-            "korean": "ko",
-            "russian": "ru",
-            "italian": "it",
-            "portuguese": "pt",
-            "arabic": "ar",
-            "hindi": "hi",
-        }
-        lang_lower = lang.lower()
-        return lang_map.get(lang_lower, lang_lower)
 
     def _strip_thinking(self, text: str) -> str:
         """去除 Qwen thinking 输出，保留翻译内容"""
