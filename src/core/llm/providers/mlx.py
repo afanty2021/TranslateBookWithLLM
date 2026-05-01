@@ -240,6 +240,23 @@ class MLXProvider(LLMProvider):
         # 清理 <thinking>...</thinking> 标签
         text = re.sub(r'<thinking>.*?</thinking>', '', text, flags=re.DOTALL)
 
+        # 清理数字列表格式的思考过程
+        # 匹配从 "1. **" 或 "2. **" 等开始，包括所有后续缩进的内容，直到 HTML 标签或文本末尾
+        text = re.sub(
+            r'(?:^|>)\s*\d+\.\s+\*\*[^*]*?\*\*.*?(?=\n\s*<|\n\s*\d+\.\s*\*\*|\Z)',
+            lambda m: '>' if m.group(0).strip().startswith('>') else '',
+            text,
+            flags=re.DOTALL | re.MULTILINE
+        )
+
+        # 清理残留的思考格式行 (以 "- **" 或 "*   " 开头的内容)
+        text = re.sub(
+            r'(?:^|>)\s*[\-\*]\s+\*\*[^*]*?\*\*.*?(?=<|\n|\Z)',
+            lambda m: '>' if m.group(0).startswith('>') else '',
+            text,
+            flags=re.DOTALL | re.MULTILINE
+        )
+
         return text.strip()
 
     def _detect_repetition(self, text: str) -> tuple[bool, str]:
@@ -303,7 +320,8 @@ class MLXProvider(LLMProvider):
         messages = self._build_messages(prompt, system_prompt)
 
         # Qwen thinking models with prefill need more tokens for translation output
-        max_tokens = 2048 if self._is_qwen_thinking else 1024
+        # 增加 max_tokens 以确保有足够空间输出翻译结果（thinking可能占用1000+ tokens）
+        max_tokens = 4096 if self._is_qwen_thinking else 1024
 
         payload = {
             "model": self.model,
@@ -312,6 +330,7 @@ class MLXProvider(LLMProvider):
             "max_tokens": max_tokens,
             "repetition_penalty": 1.1 if self._is_qwen_thinking else 1.0,
             "frequency_penalty": 0.3 if self._is_qwen_thinking else 0.0,
+            "temperature": 0.7 if self._is_qwen_thinking else 0.0,
         }
 
         client = await self._get_mlx_client()
